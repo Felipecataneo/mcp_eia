@@ -16,11 +16,10 @@ COPY eia_server.py .
 # Isso é apenas para testar localmente com Docker Compose sem usar .env global
 # ENV EIA_API_KEY="SUA_CHAVE_AQUI" 
 
-# Expõe a porta que o Uvicorn vai escutar
+# Expõe a porta que o Uvicorn (interno ao FastMCP) vai escutar
 EXPOSE 8000
 
-# Comando para rodar o servidor Uvicorn
-# --host 0.0.0.0 para escutar em todas as interfaces, acessível de fora do contêiner
-# --port 8000 para a porta exposta
-# app:app se refere à instância 'app' dentro do módulo 'app.py' (aqui 'eia_server:app')
-CMD ["uvicorn", "eia_server:app", "--host", "0.0.0.0", "--port", "8000"]
+# Comando para rodar o servidor FastMCP com transporte SSE
+# Ele usará o host e a porta definidos no construtor do FastMCP
+# e executará o servidor web (uvicorn) internamente.
+CMD ["python", "eia_server.py"]
