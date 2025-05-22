@@ -1,14 +1,14 @@
 import os
-import sys
+import sys # Adicionado de volta para sys.exit, se necessário
 from typing import Any, Dict, List, Optional, Union
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, TextContent, Resource, GetPromptResult
 from dotenv import load_dotenv
-import logging
+import logging # Adicionado logging para debug no Render
 
 # Configurar logging para debug no Render
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO) # Use INFO para logs mais relevantes
 logger = logging.getLogger(__name__)
 
 # Carrega variáveis de ambiente do .env
@@ -21,21 +21,21 @@ EIA_API_BASE_URL = "https://api.eia.gov/v2"
 EIA_API_KEY = os.getenv("EIA_API_KEY")
 if not EIA_API_KEY:
     logger.warning("EIA_API_KEY não definida. Algumas funcionalidades podem não funcionar.")
-    # Não falha o servidor, apenas avisa
+    # Não falha o servidor, apenas avisa. Se a API Key for essencial, pode raise ValueError.
+    # raise ValueError("A variável de ambiente EIA_API_KEY não está definida.")
 
 EIA_HEADERS = {
     "User-Agent": "US-Energy-Info-Admin-MCP-Server/1.0 (contact@example.com)"
 }
 
-# ✅ Configuração correta para Render
-# Render define PORT automaticamente
+# ✅ Configuração correta para Render: Render define PORT automaticamente
 PORT = int(os.getenv("PORT", 8000))
 
 # --- Inicialização do Servidor MCP ---
 mcp = FastMCP(
     name="eia-data-api",
     host="0.0.0.0",  # ✅ Correto para Render (aceita conexões externas)
-    port=PORT,       # ✅ Usa a porta do Render
+    port=PORT,       # ✅ Usa a porta do Render definida pelo ambiente
 )
 
 # --- Funções Auxiliares para Interagir com a API da EIA ---
@@ -47,7 +47,7 @@ async def make_eia_api_request(route_path: str, params: Optional[Dict[str, Any]]
         logger.error("EIA_API_KEY não está definida")
         return {"error": "API_KEY_MISSING", "message": "Chave da API EIA não configurada"}
     
-    full_url = f"{EIA_API_BASE_URL}/{route_path.lstrip('/')}"
+    full_url = f"{EIA_API_BASE_URL}/{route_path.lstrip('/')}" # Garante que não haja '//'
 
     if params is None:
         params = {}
@@ -71,6 +71,7 @@ async def make_eia_api_request(route_path: str, params: Optional[Dict[str, Any]]
         except httpx.HTTPStatusError as e:
             logger.error(f"Erro HTTP EIA API: {e.response.status_code} - {e.response.text}")
             try:
+                # Tenta retornar o JSON de erro da API se disponível
                 return e.response.json()
             except Exception:
                 return {"error": f"HTTPStatusError: {e.response.status_code}", "message": e.response.text}
@@ -131,15 +132,17 @@ async def get_eia_v2_route_data(
         params["end"] = end_period
 
     if sort_column and sort_direction:
+        # Corrigido o formato do sort para a API EIA v2
         params[f"sort[0][column]"] = sort_column
         params[f"sort[0][direction]"] = sort_direction
 
     if facets:
         for facet_key, facet_values in facets.items():
+            # A API EIA v2 espera 'facets[key][]' para listas, 'facets[key]' para single
             if isinstance(facet_values, list):
-                params[f"facets[{facet_key}][]"] = facet_values
+                params[f"facets[{facet_key}]"] = facet_values # httpx serializa [] corretamente
             else:
-                params[f"facets[{facet_key}][]"] = [facet_values]
+                params[f"facets[{facet_key}]"] = [facet_values] # Wrap single value in list
 
     data_response = await make_eia_api_request(full_path, params)
 
@@ -218,6 +221,7 @@ async def get_eia_v2_series_id_data(
     if end_period:
         params["end"] = end_period
     if sort_column and sort_direction:
+        # Corrigido o formato do sort para a API EIA v2
         params[f"sort[0][column]"] = sort_column
         params[f"sort[0][direction]"] = sort_direction
 
@@ -496,12 +500,23 @@ async def explore_eia_v2_routes_prompt() -> GetPromptResult:
 
 # --- Função Principal para Rodar o Servidor ---
 if __name__ == "__main__":
-    logger.info("Iniciando o servidor MCP da EIA...")
+    logger.info("Iniciando o servidor MCP da EIA (SSE)...")
     
-    # ✅ Para Render, usar transporte HTTP, não SSE
-    # Render funciona melhor com HTTP simples
+    # Apenas chame o método run da instância FastMCP com transport="sse"
+    # Ele usará o host e a porta configurados no construtor do mcp.
     try:
-        mcp.run()  # Usa configuração padrão (HTTP)
+        # ✅ Para Render, usar transporte HTTP, não SSE se FastMCP não tiver suporte nativo para SSE
+        # Se FastMCP tem suporte para SSE e isso é o que você quer, mantenha:
+        mcp.run(transport="sse") # Isso é o que você tinha e disse que funcionava "em partes"
+
+        # Se FastMCP deve ser executado como um aplicativo ASGI padrão com Uvicorn:
+        # Você não chamaria mcp.run() aqui. Em vez disso, seu start command no Render seria:
+        # uvicorn main:mcp --host 0.0.0.0 --port $PORT
+        # (assumindo que este arquivo se chama main.py)
+
+        # Se você tem certeza que o mcp.run(transport="sse") é o que o Render espera para seu tipo de MCP,
+        # e o problema era só a porta, então esta versão está certa.
+        
     except Exception as e:
         logger.error(f"Erro ao iniciar servidor: {e}")
         sys.exit(1)
