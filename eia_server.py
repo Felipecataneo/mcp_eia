@@ -9,10 +9,10 @@ from dotenv import load_dotenv
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.responses import JSONResponse
-# CORREÇÃO: Usar SseServerTransport explicitamente
+# CORREÇÃO: SseServerTransport não recebe 'path'
 from mcp.server.sse import SseServerTransport 
 import uvicorn
-import asyncio # Necessário para rodar funções assíncronas no setup da Starlette
+import asyncio 
 
 # Carrega variáveis de ambiente do .env
 load_dotenv()
@@ -339,10 +339,9 @@ async def explore_eia_v2_routes_prompt() -> GetPromptResult:
     return GetPromptResult(description=description, messages=messages)
 
 # --- Função Principal para Rodar o Servidor ---
-# ALTERAÇÃO: Para Streamable HTTP (SSE)
 # CORREÇÃO: sse_transport é instanciado e conectado ao mcp.
 # A Starlette precisa do método de tratamento de requisições do sse_transport.
-sse_transport = SseServerTransport(path="/mcp") # Endpoint para comunicação MCP
+sse_transport = SseServerTransport() # Sem o argumento 'path' no construtor
 
 app = Starlette(routes=[
     Route("/mcp", endpoint=sse_transport.handle_request), # Usar o método handle_request do sse_transport
@@ -350,17 +349,17 @@ app = Starlette(routes=[
 
 # Conecta a instância FastMCP ao sse_transport
 # Isso precisa ser feito APÓS a criação do sse_transport
-async def connect_mcp_to_transport():
-    await mcp.connect(sse_transport)
-
-# Garante que a conexão do MCP ao transporte seja feita na inicialização do Uvicorn
-# Uvicorn não tem um hook direto para o "startup" da Starlette, mas podemos usar um wrapper.
-# Ou, de forma mais simples e robusta, criar um `on_startup` hook na Starlette:
+# E APENAS UMA VEZ na inicialização da aplicação
 @app.on_event("startup")
 async def startup_event():
     print("Starlette app starting up, connecting MCP to SSE transport...")
-    await connect_mcp_to_transport()
-    print("MCP connected to SSE transport.")
+    try:
+        await mcp.connect(sse_transport)
+        print("MCP connected to SSE transport successfully.")
+    except Exception as e:
+        print(f"ERROR: Failed to connect MCP to SSE transport: {e}")
+        # Em um deploy, você pode querer levantar a exceção ou parar o app aqui
+        # raise
 
 # Para rodar com uvicorn, o nome do arquivo deve ser `eia_server.py` e o objeto da aplicação `app`.
 # Ex: uvicorn eia_server:app --host 0.0.0.0 --port 8000
