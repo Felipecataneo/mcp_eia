@@ -9,8 +9,10 @@ from dotenv import load_dotenv
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.responses import JSONResponse
-from mcp.server.sse import SseServerTransport
+# CORREÇÃO: Usar SseServerTransport explicitamente
+from mcp.server.sse import SseServerTransport 
 import uvicorn
+import asyncio # Necessário para rodar funções assíncronas no setup da Starlette
 
 # Carrega variáveis de ambiente do .env
 load_dotenv()
@@ -19,9 +21,6 @@ load_dotenv()
 EIA_API_BASE_URL = "https://api.eia.gov/v2" 
 EIA_API_KEY = os.getenv("EIA_API_KEY") 
 if not EIA_API_KEY:
-    # Em produção (Render), a variável de ambiente será definida diretamente, não por .env
-    # Se você quiser rodar localmente e testar isso, remova o `raise ValueError`
-    # print("WARNING: EIA_API_KEY not found in .env. Ensure it's set as an environment variable.")
     raise ValueError("A variável de ambiente EIA_API_KEY não está definida.")
 
 EIA_HEADERS = {
@@ -59,7 +58,6 @@ async def make_eia_api_request(route_path: str, params: Optional[Dict[str, Any]]
             return None
 
 # --- Ferramentas (Tools) da EIA ---
-
 @mcp.tool()
 async def get_eia_v2_route_data(
     route_path_with_data_segment: str,
@@ -342,13 +340,28 @@ async def explore_eia_v2_routes_prompt() -> GetPromptResult:
 
 # --- Função Principal para Rodar o Servidor ---
 # ALTERAÇÃO: Para Streamable HTTP (SSE)
+# CORREÇÃO: sse_transport é instanciado e conectado ao mcp.
+# A Starlette precisa do método de tratamento de requisições do sse_transport.
+sse_transport = SseServerTransport(path="/mcp") # Endpoint para comunicação MCP
+
 app = Starlette(routes=[
-    Route("/mcp", endpoint=mcp.create_sse_endpoint()), # Endpoint para comunicação MCP
+    Route("/mcp", endpoint=sse_transport.handle_request), # Usar o método handle_request do sse_transport
 ])
 
-if __name__ == "__main__":
-    print("Iniciando o servidor MCP da EIA (SSE)...")
-    # Configurar uvicorn para rodar a aplicação Starlette
-    # host='0.0.0.0' para ser acessível de fora do contêiner Docker
-    # port=8000 é a porta padrão para apps web Python
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# Conecta a instância FastMCP ao sse_transport
+# Isso precisa ser feito APÓS a criação do sse_transport
+async def connect_mcp_to_transport():
+    await mcp.connect(sse_transport)
+
+# Garante que a conexão do MCP ao transporte seja feita na inicialização do Uvicorn
+# Uvicorn não tem um hook direto para o "startup" da Starlette, mas podemos usar um wrapper.
+# Ou, de forma mais simples e robusta, criar um `on_startup` hook na Starlette:
+@app.on_event("startup")
+async def startup_event():
+    print("Starlette app starting up, connecting MCP to SSE transport...")
+    await connect_mcp_to_transport()
+    print("MCP connected to SSE transport.")
+
+# Para rodar com uvicorn, o nome do arquivo deve ser `eia_server.py` e o objeto da aplicação `app`.
+# Ex: uvicorn eia_server:app --host 0.0.0.0 --port 8000
+# Já está configurado no Dockerfile.
