@@ -5,19 +5,33 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, TextContent, Resource, GetPromptResult
 from dotenv import load_dotenv
 
+# Importações específicas para SSE/HTTP
+from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.responses import JSONResponse
+from mcp.server.sse import SseServerTransport
+import uvicorn
+
+# Carrega variáveis de ambiente do .env
 load_dotenv()
 
+# --- Configurações da API da EIA ---
 EIA_API_BASE_URL = "https://api.eia.gov/v2" 
 EIA_API_KEY = os.getenv("EIA_API_KEY") 
 if not EIA_API_KEY:
+    # Em produção (Render), a variável de ambiente será definida diretamente, não por .env
+    # Se você quiser rodar localmente e testar isso, remova o `raise ValueError`
+    # print("WARNING: EIA_API_KEY not found in .env. Ensure it's set as an environment variable.")
     raise ValueError("A variável de ambiente EIA_API_KEY não está definida.")
 
 EIA_HEADERS = {
     "User-Agent": "US-Energy-Info-Admin-MCP-Server/1.0 (contact@example.com)"
 }
 
+# --- Inicialização do Servidor MCP ---
 mcp = FastMCP("eia-data-api")
 
+# --- Funções Auxiliares para Interagir com a API da EIA ---
 async def make_eia_api_request(route_path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     full_url = f"{EIA_API_BASE_URL}/{route_path}"
     
@@ -32,7 +46,7 @@ async def make_eia_api_request(route_path: str, params: Optional[Dict[str, Any]]
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(full_url, params=params_with_key, headers=EIA_HEADERS, timeout=30.0)
-            response.raise_for_status()
+            response.raise_for_status() 
             return response.json()
         except httpx.HTTPStatusError as e:
             print(f"Erro HTTP ao acessar EIA API: {e.response.status_code} - {e.response.text}")
@@ -43,6 +57,8 @@ async def make_eia_api_request(route_path: str, params: Optional[Dict[str, Any]]
         except Exception as e:
             print(f"Erro inesperado ao acessar EIA API: {e}")
             return None
+
+# --- Ferramentas (Tools) da EIA ---
 
 @mcp.tool()
 async def get_eia_v2_route_data(
@@ -200,21 +216,15 @@ async def list_eia_v2_routes(
 
     formatted_info = []
     
-    # === CORREÇÃO CRÍTICA AQUI ===
-    # A resposta para /v2/ contém as rotas dentro de 'response' -> 'routes'
-    # A resposta para /v2/electricity contém as rotas diretamente em 'routes' (quando chamamos /v2/electricity)
-    
-    # Tente pegar o objeto 'response' primeiro se existir, senão use o 'data' principal
     response_obj = data.get('response', data) 
     
-    routes_list = response_obj.get('routes', []) # Pega a lista de rotas/categorias, se existir em response_obj
+    routes_list = response_obj.get('routes', []) 
     
     if routes_list:
-        if not segment_path: # Se for o nível superior
+        if not segment_path: 
             formatted_info.append("Rotas de Nível Superior Disponíveis:")
-        else: # Se for uma sub-rota específica (e.g., /v2/electricity)
+        else: 
             formatted_info.append(f"Sub-Rotas para '{segment_path}':")
-            # Adicionar metadados da rota atual, se existirem (id, name, description)
             if response_obj.get('id'): formatted_info.append(f"  ID da Rota: {response_obj.get('id')}")
             if response_obj.get('name'): formatted_info.append(f"  Nome da Rota: {response_obj.get('name')}")
             if response_obj.get('description'): formatted_info.append(f"  Descrição: {response_obj.get('description')}")
@@ -224,15 +234,12 @@ async def list_eia_v2_routes(
             if route_item.get('description'):
                 formatted_info.append(f"    Descrição: {route_item.get('description', 'N/A')}")
     else:
-        # Se não houver 'routes' no 'response_obj', pode ser que seja uma rota folha ou que a resposta seja diferente
-        # Tente formatar os metadados da própria rota, se houver, assumindo que `response_obj` É a info da rota.
         if response_obj.get('id') or response_obj.get('name') or response_obj.get('description'):
             formatted_info.append(f"Metadados da Rota '{segment_path}':")
             if response_obj.get('id'): formatted_info.append(f"  ID: {response_obj.get('id')}")
             if response_obj.get('name'): formatted_info.append(f"  Nome: {response_obj.get('name')}")
             if response_obj.get('description'): formatted_info.append(f"  Descrição: {response_obj.get('description')}")
             
-            # Adicionar facets, data columns e frequencies se existirem para esta rota
             facets = response_obj.get('facets', [])
             if facets:
                 formatted_info.append("\nFacets (Filtros de Dimensão):")
@@ -251,7 +258,6 @@ async def list_eia_v2_routes(
                 for freq in frequencies:
                     formatted_info.append(f"  - ID: {freq.get('id', 'N/A')}, Descrição: {freq.get('description', 'N/A')}, Formato: {freq.get('format', 'N/A')}")
         else:
-            # Caso a resposta seja vazia ou inesperada e não contenha 'routes' ou metadados de rota
             return CallToolResult(
                 is_error=True,
                 content=[TextContent(type="text", text=f"Resposta da API da EIA para '{path_to_list}' não contém informações de rota ou sub-rotas esperadas.")]
@@ -335,13 +341,14 @@ async def explore_eia_v2_routes_prompt() -> GetPromptResult:
     return GetPromptResult(description=description, messages=messages)
 
 # --- Função Principal para Rodar o Servidor ---
+# ALTERAÇÃO: Para Streamable HTTP (SSE)
+app = Starlette(routes=[
+    Route("/mcp", endpoint=mcp.create_sse_endpoint()), # Endpoint para comunicação MCP
+])
+
 if __name__ == "__main__":
-    print("Iniciando o servidor MCP da EIA...")
-    try:
-        mcp.run(transport='stdio')
-    except ValueError as e:
-        print(f"Erro de inicialização: {e}")
-    except Exception as e:
-        print(f"Ocorreu um erro inesperado ao iniciar o servidor: {e}")
-    finally:
-        print("Servidor MCP da EIA encerrado.")
+    print("Iniciando o servidor MCP da EIA (SSE)...")
+    # Configurar uvicorn para rodar a aplicação Starlette
+    # host='0.0.0.0' para ser acessível de fora do contêiner Docker
+    # port=8000 é a porta padrão para apps web Python
+    uvicorn.run(app, host="0.0.0.0", port=8000)

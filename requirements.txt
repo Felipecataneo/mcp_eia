@@ -1,0 +1,5 @@
+mcp[cli] # Instala o SDK MCP com dependências da CLI (inclui httpx)
+httpx # Mesmo que já incluído em mcp[cli], bom ser explícito
+python-dotenv
+uvicorn # Servidor ASGI para Starlette
+starlette # Framework web ASGI para MCP SSE
