@@ -7,6 +7,7 @@ from mcp.types import CallToolResult, TextContent, Resource, GetPromptResult
 from dotenv import load_dotenv
 import logging
 import json
+from urllib.parse import urlencode
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -35,7 +36,7 @@ CONCEPT_MAPPING = {
     },
     "petroleum": {
         "keywords": ["petróleo", "gasolina", "diesel", "crude oil", "combustível", "refino"],
-        "routes": ["petroleum", "petroleum/supply/weekly", "petroleum/supply/historical"]
+        "routes": ["petroleum", "petroleum/crd/crpdn", "petroleum/supply/weekly", "petroleum/supply/historical"]
     },
     "natural-gas": {
         "keywords": ["gás natural", "gas natural", "lng", "pipeline"],
@@ -63,8 +64,33 @@ mcp = FastMCP(
 )
 
 # --- Funções Auxiliares ---
+def format_eia_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Formata parâmetros para o formato correto da API EIA.
+    Converte listas em parâmetros indexados como data[0]=value, data[1]=price
+    """
+    formatted_params = {}
+    
+    for key, value in params.items():
+        if isinstance(value, list):
+            # Converter listas para formato indexado
+            for i, item in enumerate(value):
+                formatted_params[f"{key}[{i}]"] = item
+        elif isinstance(value, dict):
+            # Para objetos aninhados como sort[0][column]=period
+            for sub_key, sub_value in value.items():
+                if isinstance(sub_value, list):
+                    for i, item in enumerate(sub_value):
+                        formatted_params[f"{key}[{i}][{sub_key}]"] = item
+                else:
+                    formatted_params[f"{key}[{sub_key}]"] = sub_value
+        else:
+            formatted_params[key] = value
+    
+    return formatted_params
+
 async def make_eia_api_request(route_path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """Faz requisição à API da EIA com tratamento robusto de erros."""
+    """Faz requisição à API da EIA com tratamento robusto de erros e formatação correta."""
     if not EIA_API_KEY:
         logger.error("EIA_API_KEY não está definida")
         return {"error": "API_KEY_MISSING", "message": "Chave da API EIA não configurada"}
@@ -74,26 +100,37 @@ async def make_eia_api_request(route_path: str, params: Optional[Dict[str, Any]]
     if params is None:
         params = {}
     
-    params_with_key = {**params, 'api_key': EIA_API_KEY}
+    # Formatar parâmetros corretamente
+    formatted_params = format_eia_params(params)
+    formatted_params['api_key'] = EIA_API_KEY
     
-    # Log para debug (sem expor a API key)
-    temp_params = {k: v for k, v in params_with_key.items() if k != 'api_key'}
-    logger.info(f"Fazendo requisição EIA: {full_url} com params: {temp_params}")
-
+    # Log detalhado para debug
+    temp_params = {k: v for k, v in formatted_params.items() if k != 'api_key'}
+    logger.info(f"URL: {full_url}")
+    logger.info(f"Parâmetros formatados: {temp_params}")
+    
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
                 full_url, 
-                params=params_with_key, 
+                params=formatted_params, 
                 headers=EIA_HEADERS, 
-                timeout=30.0
+                timeout=60.0  # Aumentado timeout
             )
+            
+            # Log da URL final para debug
+            logger.info(f"URL final: {response.url}")
+            
             response.raise_for_status()
             return response.json()
+            
         except httpx.HTTPStatusError as e:
-            logger.error(f"Erro HTTP EIA API: {e.response.status_code} - {e.response.text}")
+            logger.error(f"Erro HTTP EIA API: {e.response.status_code}")
+            logger.error(f"Response text: {e.response.text}")
             try:
-                return e.response.json()
+                error_response = e.response.json()
+                logger.error(f"Error details: {error_response}")
+                return error_response
             except Exception:
                 return {"error": f"HTTPStatusError: {e.response.status_code}", "message": e.response.text}
         except httpx.RequestError as e:
@@ -127,7 +164,9 @@ async def search_energy_data(
     frequency: Optional[str] = None,
     start_period: Optional[str] = None,
     end_period: Optional[str] = None,
-    limit: int = 100
+    limit: int = 100,
+    sort_column: Optional[str] = "period",
+    sort_direction: Optional[str] = "desc"
 ) -> CallToolResult:
     """
     Busca dados de energia da EIA de forma inteligente. 
@@ -140,12 +179,14 @@ async def search_energy_data(
     Args:
         query: Descrição do que você está procurando (ex: "consumo de eletricidade residencial no Texas")
         specific_route: Rota específica se conhecida (ex: "electricity/retail-sales")
-        data_elements: Elementos de dados específicos (ex: ["price", "sales"])
+        data_elements: Elementos de dados específicos (ex: ["value", "price"])
         filters: Filtros/facets (ex: {"stateid": ["TX"], "sectorid": ["RES"]})
         frequency: Frequência dos dados (ex: "monthly", "annual")
         start_period: Período inicial (ex: "2020")
         end_period: Período final (ex: "2023")
         limit: Limite de registros retornados
+        sort_column: Coluna para ordenação (padrão: "period")
+        sort_direction: Direção da ordenação (padrão: "desc")
     """
     
     # Fase 1: Descoberta de rotas se não especificada
@@ -204,7 +245,7 @@ Para obter dados, especifique uma sub-rota mais específica no parâmetro 'speci
         )
     
     # Fase 3: Se não temos parâmetros suficientes, mostrar metadados para ajudar
-    if not data_elements or not filters:
+    if not data_elements:
         metadata_info = [f"Metadados para '{specific_route}':"]
         
         if response_content.get('name'):
@@ -241,8 +282,9 @@ Para obter dados, especifique uma sub-rota mais específica no parâmetro 'speci
                 metadata_info.append(f"  - {freq_id}: {freq_desc}")
         
         metadata_info.append(f"\nPara obter dados reais, chame novamente especificando:")
-        metadata_info.append(f"- data_elements: lista dos elementos que deseja")
-        metadata_info.append(f"- filters: dicionário com os filtros (ex: {{'stateid': ['TX']}})")
+        metadata_info.append(f"- data_elements: lista dos elementos que deseja (ex: ['value'])")
+        metadata_info.append(f"- filters: dicionário com os filtros se necessário")
+        metadata_info.append(f"- frequency: frequência desejada se aplicável")
         
         return CallToolResult(
             content=[TextContent(type="text", text="\n".join(metadata_info))]
@@ -255,8 +297,10 @@ Para obter dados, especifique uma sub-rota mais específica no parâmetro 'speci
         "offset": 0
     }
     
+    # Formatação correta dos parâmetros
     if data_elements:
-        params["data"] = data_elements
+        params["data"] = data_elements  # Será convertido para data[0]=value, data[1]=price, etc.
+    
     if frequency:
         params["frequency"] = frequency
     if start_period:
@@ -264,19 +308,35 @@ Para obter dados, especifique uma sub-rota mais específica no parâmetro 'speci
     if end_period:
         params["end"] = end_period
     
+    # Adicionar ordenação padrão
+    if sort_column:
+        params["sort"] = [{"column": sort_column, "direction": sort_direction}]
+    
+    # Formatação correta dos filtros/facets
     if filters:
         for facet_key, facet_values in filters.items():
             if isinstance(facet_values, list):
-                params[f"facets[{facet_key}]"] = facet_values
+                params[f"facets[{facet_key}][]"] = facet_values
             else:
-                params[f"facets[{facet_key}]"] = [facet_values]
+                params[f"facets[{facet_key}][]"] = [facet_values]
+    
+    logger.info(f"Fazendo requisição de dados para: {data_route}")
+    logger.info(f"Parâmetros antes da formatação: {params}")
     
     data_response = await make_eia_api_request(data_route, params)
     
-    if not data_response or data_response.get("error"):
+    if not data_response:
+        return CallToolResult(
+            is_error=True, 
+            content=[TextContent(type="text", text=f"Falha na requisição para '{data_route}' - sem resposta")]
+        )
+    
+    if data_response.get("error"):
         error_msg = f"Erro ao recuperar dados de '{data_route}'"
-        if data_response and data_response.get("message"):
+        if data_response.get("message"):
             error_msg += f": {data_response['message']}"
+        if data_response.get("data"):
+            error_msg += f"\nDetalhes: {data_response.get('data')}"
         return CallToolResult(is_error=True, content=[TextContent(type="text", text=error_msg)])
     
     response_data = data_response.get('response', {})
@@ -303,10 +363,14 @@ Para obter dados, especifique uma sub-rota mais específica no parâmetro 'speci
         separator_line = "|" + "---|".join(["---"] * len(columns)) + "|"
         output_lines.extend([header_line, separator_line])
         
-        # Dados da tabela
-        for row in actual_data:
+        # Dados da tabela (limitado a 50 linhas para evitar overflow)
+        display_data = actual_data[:50]
+        for row in display_data:
             row_values = [str(row.get(col, 'N/A')) for col in columns]
             output_lines.append("| " + " | ".join(row_values) + " |")
+        
+        if len(actual_data) > 50:
+            output_lines.append(f"... e mais {len(actual_data) - 50} registros")
         
         # Informações adicionais
         output_lines.append("")
@@ -422,6 +486,38 @@ async def get_series_data(series_id: str, start: Optional[str] = None, end: Opti
         content=[TextContent(type="text", text="\n".join(output_lines))]
     )
 
+# --- Ferramenta para Teste Direto ---
+@mcp.tool()
+async def test_direct_api_call(url_path: str, params_dict: Optional[Dict[str, Any]] = None) -> CallToolResult:
+    """
+    Ferramenta para teste direto de chamadas da API EIA.
+    Use para debug e testes específicos.
+    
+    Args:
+        url_path: Caminho da URL (ex: "petroleum/crd/crpdn/data/")
+        params_dict: Parâmetros como dicionário
+    """
+    if params_dict is None:
+        params_dict = {}
+    
+    logger.info(f"Teste direto - URL: {url_path}")
+    logger.info(f"Teste direto - Parâmetros: {params_dict}")
+    
+    response = await make_eia_api_request(url_path, params_dict)
+    
+    if not response:
+        return CallToolResult(
+            is_error=True,
+            content=[TextContent(type="text", text="Falha na requisição - sem resposta")]
+        )
+    
+    # Retornar resposta bruta para análise
+    response_str = json.dumps(response, indent=2, ensure_ascii=False)
+    
+    return CallToolResult(
+        content=[TextContent(type="text", text=f"Resposta da API:\n\n{response_str}")]
+    )
+
 # --- Recursos ---
 @mcp.resource(uri="eia://guide", name="Guia do Servidor EIA", description="Guia completo para usar o servidor MCP da EIA")
 async def get_eia_guide() -> Resource:
@@ -454,16 +550,29 @@ Para obter valores específicos de filtros:
 Para compatibilidade com Series IDs da API v1:
 - `get_series_data(series_id="ELEC.SALES.US-ALL.A")`
 
+### 4. test_direct_api_call()
+Para testes e debug diretos:
+- `test_direct_api_call(url_path="petroleum/crd/crpdn/data/", params_dict={"frequency": "monthly", "data": ["value"]})`
+
+## Correções Implementadas
+
+1. **Formatação de Parâmetros**: Arrays agora são formatados corretamente como `data[0]=value`
+2. **Timeout Aumentado**: Para requisições mais longas
+3. **Logging Melhorado**: Para debug detalhado
+4. **Tratamento de Erros**: Mais robusto e informativo
+5. **Ordenação Padrão**: Incluída automaticamente
+
 ## Fluxo Recomendado
 
 1. **Início Exploratório**: Use `search_energy_data()` com uma consulta geral
 2. **Refinamento**: Use as informações retornadas para especificar rotas e parâmetros
 3. **Obtenção de Dados**: Chame novamente com parâmetros específicos para dados reais
+4. **Debug**: Use `test_direct_api_call()` se algo não funcionar
 
 ## Categorias Principais de Dados
 
 - **Eletricidade**: Geração, consumo, preços, capacidade
-- **Petróleo**: Produção, refino, preços, estoques
+- **Petróleo**: Produção, refino, preços, estoques (incluindo petroleum/crd/crpdn)
 - **Gás Natural**: Produção, consumo, preços, capacidade
 - **Carvão**: Produção, consumo, preços
 - **Energia Renovável**: Solar, eólica, hidráulica
@@ -475,6 +584,7 @@ Para compatibilidade com Series IDs da API v1:
 - Seja específico sobre localização (estado, região) quando relevante
 - Especifique período de tempo quando necessário
 - Use filtros para refinar resultados (por estado, setor, tipo de combustível, etc.)
+- Para debug, use a ferramenta `test_direct_api_call()`
 """
     
     return Resource(
@@ -502,7 +612,9 @@ Use a ferramenta search_energy_data() como ponto de partida para qualquer consul
 2. Explorar metadados quando necessário
 3. Recuperar dados reais quando os parâmetros estão completos
 
-Sempre comece com consultas gerais e vá refinando conforme necessário. Seja proativo em sugerir filtros e parâmetros úteis baseados no contexto da pergunta do usuário."""
+Sempre comece com consultas gerais e vá refinando conforme necessário. Seja proativo em sugerir filtros e parâmetros úteis baseados no contexto da pergunta do usuário.
+
+Se algo não funcionar, use a ferramenta test_direct_api_call() para debug."""
                 )
             }
         ]
