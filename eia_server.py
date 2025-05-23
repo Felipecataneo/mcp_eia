@@ -754,35 +754,6 @@ Comece sua análise agora!
     )
 
 
-# --- Endpoint de Health Check para Render ---
-@mcp.get("/health")
-async def health_check():
-    """Health check endpoint para o Render detectar que o serviço está rodando."""
-    return {"status": "healthy", "service": "eia-energy-mcp-server"}
-
-
-@mcp.get("/")
-async def root():
-    """Root endpoint com informações do serviço."""
-    return {
-        "service": "EIA Energy Data MCP Server",
-        "version": "2.0",
-        "status": "running",
-        "port": PORT,
-        "endpoints": {
-            "/health": "Health check",
-            "/": "Service info"
-        },
-        "mcp_tools": [
-            "smart_energy_search",
-            "explore_energy_routes", 
-            "get_energy_data",
-            "get_route_info",
-            "get_facet_values"
-        ]
-    }
-
-
 # --- Inicialização do Servidor ---
 if __name__ == "__main__":
     logger.info(f"Iniciando servidor EIA MCP na porta {PORT}")
