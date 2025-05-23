@@ -89,6 +89,9 @@ def format_eia_params(params: Dict[str, Any]) -> Dict[str, Any]:
     
     for key, value in params.items():
         if key == "facets" and isinstance(value, dict):
+            # Pular facets vazios
+            if not value:
+                continue
             # Formatação especial para facets: facets[stateid][]=TX&facets[stateid][]=CA
             for facet_key, facet_values in value.items():
                 if isinstance(facet_values, list):
@@ -112,7 +115,7 @@ def format_eia_params(params: Dict[str, Any]) -> Dict[str, Any]:
         elif isinstance(value, list) and key not in ["facets", "data", "sort"]:
             # Para outros arrays, usar formato simples
             formatted_params[key] = ",".join(map(str, value))
-        else:
+        elif value is not None and value != "":  # Pular valores None ou strings vazias
             formatted_params[key] = value
     
     return formatted_params
