@@ -754,9 +754,12 @@ Comece sua análise agora!
     )
 
 
-# --- Inicialização do Servidor ---
+# --- Função Principal ---
 if __name__ == "__main__":
-    logger.info(f"Iniciando servidor EIA MCP na porta {PORT}")
-    logger.info(f"EIA_API_KEY configurada: {'✓' if EIA_API_KEY else '✗'}")
-    # Esta linha é essencial para o Render detectar que o serviço está rodando
-    mcp.run()
+    logger.info("Iniciando servidor MCP da EIA melhorado...")
+    
+    try:
+        mcp.run(transport="sse")
+    except Exception as e:
+        logger.error(f"Erro ao iniciar servidor: {e}")
+        sys.exit(1)
