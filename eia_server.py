@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 import logging
 import json
 from urllib.parse import urlencode
+import asyncio
+from datetime import datetime
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -23,82 +25,120 @@ if not EIA_API_KEY:
     logger.warning("EIA_API_KEY não definida. Algumas funcionalidades podem não funcionar.")
 
 EIA_HEADERS = {
-    "User-Agent": "US-Energy-Info-Admin-MCP-Server/2.0 (contact@example.com)"
+    "User-Agent": "US-Energy-Info-Admin-MCP-Server/2.1 (contact@example.com)",
+    "Accept": "application/json",
+    "Content-Type": "application/json"
 }
 
 PORT = int(os.getenv("PORT", 8000))
 
-# --- Mapeamento de conceitos para facilitar busca ---
+# --- Mapeamento expandido de conceitos ---
 CONCEPT_MAPPING = {
     "electricity": {
-        "keywords": ["eletricidade", "energia elétrica", "consumo energia", "geração energia", "preço energia"],
-        "routes": ["electricity", "electricity/retail-sales", "electricity/electric-power-operational-data"]
+        "keywords": ["eletricidade", "energia elétrica", "consumo energia", "geração energia", "preço energia", "electricity", "power", "grid"],
+        "routes": ["electricity", "electricity/retail-sales", "electricity/electric-power-operational-data", "electricity/rto", "electricity/facility-fuel"]
     },
     "petroleum": {
-        "keywords": ["petróleo", "gasolina", "diesel", "crude oil", "combustível", "refino"],
-        "routes": ["petroleum", "petroleum/crd/crpdn", "petroleum/supply/weekly", "petroleum/supply/historical"]
+        "keywords": ["petróleo", "gasolina", "diesel", "crude oil", "combustível", "refino", "petroleum", "oil", "gasoline", "refineries"],
+        "routes": ["petroleum", "petroleum/crd/crpdn", "petroleum/supply/weekly", "petroleum/supply/historical", "petroleum/pri/spt", "petroleum/sum/sndw"]
     },
     "natural-gas": {
-        "keywords": ["gás natural", "gas natural", "lng", "pipeline"],
-        "routes": ["natural-gas", "natural-gas/prod", "natural-gas/cons"]
+        "keywords": ["gás natural", "gas natural", "lng", "pipeline", "natural gas", "methane"],
+        "routes": ["natural-gas", "natural-gas/prod", "natural-gas/cons", "natural-gas/pri", "natural-gas/stor"]
     },
     "coal": {
-        "keywords": ["carvão", "coal", "mineração carvão"],
-        "routes": ["coal", "coal/production", "coal/consumption"]
+        "keywords": ["carvão", "coal", "mineração carvão", "carbon", "mining"],
+        "routes": ["coal", "coal/production", "coal/consumption", "coal/reserves"]
     },
     "renewable": {
-        "keywords": ["renovável", "solar", "eólica", "hidráulica", "biomassa", "renewable"],
-        "routes": ["electricity/electric-power-operational-data"]
+        "keywords": ["renovável", "solar", "eólica", "hidráulica", "biomassa", "renewable", "wind", "hydro", "geothermal"],
+        "routes": ["electricity/electric-power-operational-data", "renewable"]
+    },
+    "nuclear": {
+        "keywords": ["nuclear", "uranium", "reactor", "nuclear power"],
+        "routes": ["nuclear", "nuclear/fuel-cycle"]
     },
     "total-energy": {
-        "keywords": ["energia total", "consumo total", "balanço energético"],
-        "routes": ["total-energy"]
+        "keywords": ["energia total", "consumo total", "balanço energético", "total energy", "energy balance"],
+        "routes": ["total-energy", "total-energy/data"]
+    },
+    "international": {
+        "keywords": ["internacional", "world", "global", "countries", "export", "import"],
+        "routes": ["international"]
     }
 }
 
+# --- Cache simples para metadados ---
+metadata_cache = {}
+cache_ttl = 3600  # 1 hora
+
 # --- Inicialização do Servidor MCP ---
 mcp = FastMCP(
-    name="eia-energy-data",
+    name="eia-energy-data-v2",
     host="0.0.0.0",
     port=PORT,
 )
 
-# --- Funções Auxiliares ---
+# --- Funções Auxiliares Melhoradas ---
 def format_eia_params(params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Formata parâmetros para o formato correto da API EIA.
-    Converte listas em parâmetros indexados como data[0]=value, data[1]=price
+    Formata parâmetros para o formato correto da API EIA v2.
+    Melhora o tratamento de arrays e objetos aninhados.
     """
     formatted_params = {}
     
     for key, value in params.items():
-        if isinstance(value, list):
-            # Converter listas para formato indexado
-            for i, item in enumerate(value):
-                formatted_params[f"{key}[{i}]"] = item
-        elif isinstance(value, dict):
-            # Para objetos aninhados como sort[0][column]=period
-            for sub_key, sub_value in value.items():
-                if isinstance(sub_value, list):
-                    for i, item in enumerate(sub_value):
-                        formatted_params[f"{key}[{i}][{sub_key}]"] = item
+        if key == "facets" and isinstance(value, dict):
+            # Formatação especial para facets: facets[stateid][]=TX&facets[stateid][]=CA
+            for facet_key, facet_values in value.items():
+                if isinstance(facet_values, list):
+                    for facet_value in facet_values:
+                        param_key = f"facets[{facet_key}][]"
+                        if param_key not in formatted_params:
+                            formatted_params[param_key] = []
+                        formatted_params[param_key].append(facet_value)
                 else:
-                    formatted_params[f"{key}[{sub_key}]"] = sub_value
+                    formatted_params[f"facets[{facet_key}][]"] = [facet_values]
+        elif key == "data" and isinstance(value, list):
+            # data[0]=value&data[1]=price
+            for i, item in enumerate(value):
+                formatted_params[f"data[{i}]"] = item
+        elif key == "sort" and isinstance(value, list):
+            # sort[0][column]=period&sort[0][direction]=desc
+            for i, sort_item in enumerate(value):
+                if isinstance(sort_item, dict):
+                    for sort_key, sort_value in sort_item.items():
+                        formatted_params[f"sort[{i}][{sort_key}]"] = sort_value
+        elif isinstance(value, list) and key not in ["facets", "data", "sort"]:
+            # Para outros arrays, usar formato simples
+            formatted_params[key] = ",".join(map(str, value))
         else:
             formatted_params[key] = value
     
     return formatted_params
 
-async def make_eia_api_request(route_path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """Faz requisição à API da EIA com tratamento robusto de erros e formatação correta."""
+async def make_eia_api_request(route_path: str, params: Optional[Dict[str, Any]] = None, use_cache: bool = True) -> Optional[Dict[str, Any]]:
+    """Faz requisição à API da EIA com cache e tratamento robusto de erros."""
     if not EIA_API_KEY:
         logger.error("EIA_API_KEY não está definida")
         return {"error": "API_KEY_MISSING", "message": "Chave da API EIA não configurada"}
     
-    full_url = f"{EIA_API_BASE_URL}/{route_path.lstrip('/')}"
+    # Normalizar route_path
+    route_path = route_path.strip('/')
+    full_url = f"{EIA_API_BASE_URL}/{route_path}"
     
     if params is None:
         params = {}
+    
+    # Cache key para metadados (sem api_key para segurança)
+    cache_key = f"{route_path}_{json.dumps(sorted(params.items()), sort_keys=True)}"
+    
+    # Verificar cache para metadados (não para dados)
+    if use_cache and not route_path.endswith('/data') and cache_key in metadata_cache:
+        cache_entry = metadata_cache[cache_key]
+        if (datetime.now().timestamp() - cache_entry['timestamp']) < cache_ttl:
+            logger.info(f"Retornando do cache: {route_path}")
+            return cache_entry['data']
     
     # Formatar parâmetros corretamente
     formatted_params = format_eia_params(params)
@@ -107,7 +147,7 @@ async def make_eia_api_request(route_path: str, params: Optional[Dict[str, Any]]
     # Log detalhado para debug
     temp_params = {k: v for k, v in formatted_params.items() if k != 'api_key'}
     logger.info(f"URL: {full_url}")
-    logger.info(f"Parâmetros formatados: {temp_params}")
+    logger.info(f"Parâmetros formatados: {json.dumps(temp_params, indent=2)}")
     
     async with httpx.AsyncClient() as client:
         try:
@@ -115,24 +155,38 @@ async def make_eia_api_request(route_path: str, params: Optional[Dict[str, Any]]
                 full_url, 
                 params=formatted_params, 
                 headers=EIA_HEADERS, 
-                timeout=60.0  # Aumentado timeout
+                timeout=90.0  # Timeout aumentado
             )
             
-            # Log da URL final para debug
-            logger.info(f"URL final: {response.url}")
+            # Log da URL final (sem api_key)
+            url_without_key = str(response.url).replace(f"api_key={EIA_API_KEY}", "api_key=***")
+            logger.info(f"URL final: {url_without_key}")
             
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            
+            # Cache para metadados
+            if use_cache and not route_path.endswith('/data'):
+                metadata_cache[cache_key] = {
+                    'data': result,
+                    'timestamp': datetime.now().timestamp()
+                }
+            
+            return result
             
         except httpx.HTTPStatusError as e:
             logger.error(f"Erro HTTP EIA API: {e.response.status_code}")
             logger.error(f"Response text: {e.response.text}")
             try:
                 error_response = e.response.json()
-                logger.error(f"Error details: {error_response}")
+                logger.error(f"Error details: {json.dumps(error_response, indent=2)}")
                 return error_response
             except Exception:
-                return {"error": f"HTTPStatusError: {e.response.status_code}", "message": e.response.text}
+                return {
+                    "error": f"HTTPStatusError: {e.response.status_code}", 
+                    "message": e.response.text,
+                    "url": str(e.response.url).replace(f"api_key={EIA_API_KEY}", "api_key=***")
+                }
         except httpx.RequestError as e:
             logger.error(f"Erro de requisição EIA API: {e}")
             return {"error": "RequestError", "message": str(e)}
@@ -141,26 +195,63 @@ async def make_eia_api_request(route_path: str, params: Optional[Dict[str, Any]]
             return {"error": "UnexpectedError", "message": str(e)}
 
 def find_relevant_routes(query: str) -> List[str]:
-    """Encontra rotas relevantes baseadas na consulta do usuário."""
+    """Encontra rotas relevantes baseadas na consulta do usuário com scoring."""
     query_lower = query.lower()
-    relevant_routes = []
+    route_scores = {}
     
     for concept, data in CONCEPT_MAPPING.items():
+        score = 0
         for keyword in data["keywords"]:
             if keyword.lower() in query_lower:
-                relevant_routes.extend(data["routes"])
-                break
+                # Scoring baseado na especificidade e frequência
+                score += len(keyword) * query_lower.count(keyword.lower())
+        
+        if score > 0:
+            for route in data["routes"]:
+                if route not in route_scores:
+                    route_scores[route] = 0
+                route_scores[route] += score
     
-    # Remove duplicatas mantendo ordem
-    return list(dict.fromkeys(relevant_routes))
+    # Retornar rotas ordenadas por score
+    return [route for route, _ in sorted(route_scores.items(), key=lambda x: x[1], reverse=True)]
 
-# --- Ferramentas Principais ---
+def format_data_table(data: List[Dict], max_rows: int = 50) -> List[str]:
+    """Formata dados em tabela markdown com limite de linhas."""
+    if not data:
+        return ["Nenhum dado encontrado."]
+    
+    output_lines = []
+    columns = list(data[0].keys())
+    
+    # Cabeçalho da tabela
+    header_line = "| " + " | ".join(columns) + " |"
+    separator_line = "|" + "---|".join(["---"] * len(columns)) + "|"
+    output_lines.extend([header_line, separator_line])
+    
+    # Dados da tabela (limitado)
+    display_data = data[:max_rows]
+    for row in display_data:
+        row_values = []
+        for col in columns:
+            value = row.get(col, 'N/A')
+            # Formatação especial para números
+            if isinstance(value, (int, float)) and abs(value) >= 1000:
+                value = f"{value:,.2f}" if isinstance(value, float) else f"{value:,}"
+            row_values.append(str(value))
+        output_lines.append("| " + " | ".join(row_values) + " |")
+    
+    if len(data) > max_rows:
+        output_lines.append(f"\n*Mostrando {max_rows} de {len(data)} registros*")
+    
+    return output_lines
+
+# --- Ferramentas Principais Melhoradas ---
 @mcp.tool()
 async def search_energy_data(
     query: str,
     specific_route: Optional[str] = None,
     data_elements: Optional[List[str]] = None,
-    filters: Optional[Dict[str, Union[str, List[str]]]] = None,
+    facets: Optional[Dict[str, Union[str, List[str]]]] = None,
     frequency: Optional[str] = None,
     start_period: Optional[str] = None,
     end_period: Optional[str] = None,
@@ -169,515 +260,671 @@ async def search_energy_data(
     sort_direction: Optional[str] = "desc"
 ) -> CallToolResult:
     """
-    Busca dados de energia da EIA de forma inteligente. 
+    Busca dados de energia da EIA de forma inteligente e otimizada.
     
-    Esta ferramenta pode:
-    1. Descobrir automaticamente rotas relevantes baseadas na consulta
-    2. Explorar metadados de uma rota específica
-    3. Recuperar dados reais quando todos os parâmetros estão disponíveis
+    Esta ferramenta implementa um fluxo inteligente:
+    1. Descoberta automática de rotas baseada na consulta
+    2. Exploração de metadados quando necessário
+    3. Recuperação de dados reais com parâmetros completos
     
     Args:
-        query: Descrição do que você está procurando (ex: "consumo de eletricidade residencial no Texas")
+        query: Descrição natural do que você procura (ex: "consumo de eletricidade residencial no Texas em 2023")
         specific_route: Rota específica se conhecida (ex: "electricity/retail-sales")
         data_elements: Elementos de dados específicos (ex: ["value", "price"])
-        filters: Filtros/facets (ex: {"stateid": ["TX"], "sectorid": ["RES"]})
-        frequency: Frequência dos dados (ex: "monthly", "annual")
-        start_period: Período inicial (ex: "2020")
-        end_period: Período final (ex: "2023")
-        limit: Limite de registros retornados
+        facets: Filtros como dicionário (ex: {"stateid": ["TX"], "sectorid": ["RES"]})
+        frequency: Frequência dos dados (ex: "monthly", "annual", "quarterly")
+        start_period: Período inicial (ex: "2020", "2020-01")
+        end_period: Período final (ex: "2023", "2023-12")
+        limit: Número máximo de registros (padrão: 100, máximo: 5000)
         sort_column: Coluna para ordenação (padrão: "period")
-        sort_direction: Direção da ordenação (padrão: "desc")
+        sort_direction: Direção da ordenação ("asc" ou "desc", padrão: "desc")
     """
     
-    # Fase 1: Descoberta de rotas se não especificada
-    if not specific_route:
-        relevant_routes = find_relevant_routes(query)
-        if not relevant_routes:
-            # Listar rotas principais se não encontrou nada específico
-            response = await make_eia_api_request("", {})
-            if response and response.get('response', {}).get('routes'):
-                routes_info = []
-                for route in response['response']['routes']:
-                    routes_info.append(f"- {route.get('id', 'N/A')}: {route.get('name', 'N/A')}")
-                
-                return CallToolResult(
-                    content=[TextContent(type="text", text=f"""
-Não encontrei rotas específicas para "{query}". Aqui estão as categorias principais disponíveis:
+    try:
+        # Validação de entrada
+        if limit > 5000:
+            limit = 5000
+        
+        # Fase 1: Descoberta de rotas se não especificada
+        if not specific_route:
+            relevant_routes = find_relevant_routes(query)
+            if not relevant_routes:
+                # Listar categorias principais
+                response = await make_eia_api_request("", {})
+                if response and not response.get('error'):
+                    routes_info = []
+                    routes_data = response.get('response', {}).get('routes', [])
+                    for route in routes_data:
+                        route_id = route.get('id', 'N/A')
+                        route_name = route.get('name', 'N/A')
+                        route_desc = route.get('description', '')
+                        routes_info.append(f"**{route_id}**: {route_name}")
+                        if route_desc:
+                            routes_info.append(f"  ↳ {route_desc}")
+                    
+                    return CallToolResult(
+                        content=[TextContent(type="text", text=f"""
+🔍 **Busca por**: "{query}"
+
+Não encontrei rotas específicas para sua consulta. Aqui estão as categorias principais disponíveis:
 
 {chr(10).join(routes_info)}
 
-Para continuar, especifique uma categoria usando o parâmetro 'specific_route' ou reformule sua consulta com termos mais específicos como:
-- "eletricidade", "petróleo", "gás natural", "carvão", "renovável"
-                    """)]
-                )
+💡 **Dicas para refinar sua busca:**
+- Use termos específicos como: "eletricidade", "petróleo", "gás natural", "carvão", "solar"
+- Especifique localização: "Texas", "Califórnia", "região sudeste"
+- Mencione tipo de dados: "consumo", "produção", "preços"
+- Indique período: "2023", "últimos 5 anos"
+
+**Exemplo**: "consumo de eletricidade residencial no Texas em 2023"
+                        """)]
+                    )
+            
+            # Usar a rota com melhor score
+            specific_route = relevant_routes[0]
+            logger.info(f"Rota descoberta automaticamente: {specific_route} (de {len(relevant_routes)} opções)")
         
-        # Se encontrou rotas, explorar a primeira
-        specific_route = relevant_routes[0]
-        logger.info(f"Usando rota descoberta automaticamente: {specific_route}")
-    
-    # Fase 2: Exploração de metadados da rota
-    metadata_response = await make_eia_api_request(specific_route, {})
-    
-    if not metadata_response or metadata_response.get("error"):
-        return CallToolResult(
-            is_error=True,
-            content=[TextContent(type="text", text=f"Erro ao acessar rota '{specific_route}': {metadata_response.get('message', 'Erro desconhecido')}")]
-        )
-    
-    response_content = metadata_response.get('response', metadata_response)
-    
-    # Se temos sub-rotas, listar elas
-    if response_content.get('routes'):
-        subroutes_info = []
-        for subroute in response_content['routes']:
-            subroutes_info.append(f"- {subroute.get('id', 'N/A')}: {subroute.get('name', 'N/A')}")
-            if subroute.get('description'):
-                subroutes_info.append(f"  → {subroute['description']}")
+        # Fase 2: Exploração de metadados
+        metadata_response = await make_eia_api_request(specific_route, {})
         
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"""
-Rota '{specific_route}' contém as seguintes sub-rotas:
+        if not metadata_response or metadata_response.get("error"):
+            error_msg = metadata_response.get('message', 'Erro desconhecido') if metadata_response else 'Sem resposta'
+            return CallToolResult(
+                is_error=True,
+                content=[TextContent(type="text", text=f"❌ Erro ao acessar rota '{specific_route}': {error_msg}")]
+            )
+        
+        response_content = metadata_response.get('response', metadata_response)
+        
+        # Se há sub-rotas, listá-las
+        if response_content.get('routes'):
+            subroutes_info = []
+            for subroute in response_content['routes'][:20]:  # Limitar para não sobrecarregar
+                subroute_id = subroute.get('id', 'N/A')
+                subroute_name = subroute.get('name', 'N/A')
+                subroute_desc = subroute.get('description', '')
+                
+                subroutes_info.append(f"**{subroute_id}**: {subroute_name}")
+                if subroute_desc:
+                    subroutes_info.append(f"  ↳ {subroute_desc}")
+            
+            total_subroutes = len(response_content['routes'])
+            if total_subroutes > 20:
+                subroutes_info.append(f"\n*... e mais {total_subroutes - 20} sub-rotas*")
+            
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"""
+📂 **Rota**: `{specific_route}`
+📊 **Sub-rotas disponíveis** ({total_subroutes} total):
 
 {chr(10).join(subroutes_info)}
 
-Para obter dados, especifique uma sub-rota mais específica no parâmetro 'specific_route'.
-            """)]
-        )
-    
-    # Fase 3: Se não temos parâmetros suficientes, mostrar metadados para ajudar
-    if not data_elements:
-        metadata_info = [f"Metadados para '{specific_route}':"]
-        
-        if response_content.get('name'):
-            metadata_info.append(f"Nome: {response_content['name']}")
-        if response_content.get('description'):
-            metadata_info.append(f"Descrição: {response_content['description']}")
-        
-        # Mostrar elementos de dados disponíveis
-        data_meta = response_content.get('data', {})
-        if data_meta:
-            metadata_info.append("\nElementos de dados disponíveis:")
-            for col_id, col_info in data_meta.items():
-                if isinstance(col_info, dict):
-                    name = col_info.get('name', col_info.get('alias', col_id))
-                    units = col_info.get('units', 'N/A')
-                    metadata_info.append(f"  - {col_id}: {name} ({units})")
-        
-        # Mostrar facets/filtros disponíveis
-        facets_meta = response_content.get('facets', [])
-        if facets_meta:
-            metadata_info.append("\nFiltros disponíveis:")
-            for facet in facets_meta:
-                facet_id = facet.get('id', 'N/A')
-                facet_name = facet.get('name', 'N/A')
-                metadata_info.append(f"  - {facet_id}: {facet_name}")
-        
-        # Mostrar frequências disponíveis
-        frequencies = response_content.get('frequency', [])
-        if frequencies:
-            metadata_info.append("\nFrequências disponíveis:")
-            for freq in frequencies:
-                freq_id = freq.get('id', freq.get('query', 'N/A'))
-                freq_desc = freq.get('description', 'N/A')
-                metadata_info.append(f"  - {freq_id}: {freq_desc}")
-        
-        metadata_info.append(f"\nPara obter dados reais, chame novamente especificando:")
-        metadata_info.append(f"- data_elements: lista dos elementos que deseja (ex: ['value'])")
-        metadata_info.append(f"- filters: dicionário com os filtros se necessário")
-        metadata_info.append(f"- frequency: frequência desejada se aplicável")
-        
-        return CallToolResult(
-            content=[TextContent(type="text", text="\n".join(metadata_info))]
-        )
-    
-    # Fase 4: Recuperar dados reais
-    data_route = f"{specific_route.rstrip('/')}/data/"
-    params = {
-        "length": limit,
-        "offset": 0
-    }
-    
-    # Formatação correta dos parâmetros
-    if data_elements:
-        params["data"] = data_elements  # Será convertido para data[0]=value, data[1]=price, etc.
-    
-    if frequency:
-        params["frequency"] = frequency
-    if start_period:
-        params["start"] = start_period
-    if end_period:
-        params["end"] = end_period
-    
-    # Adicionar ordenação padrão
-    if sort_column:
-        params["sort"] = [{"column": sort_column, "direction": sort_direction}]
-    
-    # Formatação correta dos filtros/facets
-    if filters:
-        for facet_key, facet_values in filters.items():
-            if isinstance(facet_values, list):
-                params[f"facets[{facet_key}][]"] = facet_values
-            else:
-                params[f"facets[{facet_key}][]"] = [facet_values]
-    
-    logger.info(f"Fazendo requisição de dados para: {data_route}")
-    logger.info(f"Parâmetros antes da formatação: {params}")
-    
-    data_response = await make_eia_api_request(data_route, params)
-    
-    if not data_response:
-        return CallToolResult(
-            is_error=True, 
-            content=[TextContent(type="text", text=f"Falha na requisição para '{data_route}' - sem resposta")]
-        )
-    
-    if data_response.get("error"):
-        error_msg = f"Erro ao recuperar dados de '{data_route}'"
-        if data_response.get("message"):
-            error_msg += f": {data_response['message']}"
-        if data_response.get("data"):
-            error_msg += f"\nDetalhes: {data_response.get('data')}"
-        return CallToolResult(is_error=True, content=[TextContent(type="text", text=error_msg)])
-    
-    response_data = data_response.get('response', {})
-    actual_data = response_data.get('data', [])
-    # Adicionado: Captura a mensagem de warning da API
-    warning_message = response_data.get('warning') 
-
-    # Se não há dados retornados (e não é um erro fatal da API), informa ao LLM
-    if not actual_data and not response_data.get("error"):
-        output_message = f"Nenhum dado encontrado para os critérios especificados em '{data_route}'."
-        if warning_message:
-            output_message += f"\n\nAVISO DA API EIA: {warning_message}"
-        # Adiciona a URL completa de debug para o LLM, para que ele possa inspecionar se quiser
-        debug_params = {k: v for k, v in params.items() if k != 'api_key'}
-        full_url_with_params = f"{full_url.split('?')[0]}?{urlencode(debug_params)}"
-        output_message += f"\n\nURL da API (sem API Key): {full_url_with_params}"
-
-        return CallToolResult(
-            content=[TextContent(type="text", text=output_message)]
-        )
-    
-    # Formatação melhorada dos dados
-    total_records = response_data.get('total', len(actual_data))
-    output_lines = [
-        f"Dados de Energia - {response_content.get('name', specific_route)}",
-        f"Total de registros: {total_records} (mostrando {len(actual_data)})",
-        f"Consulta: {query}",
-        ""
-    ]
-    
-    # Adicionado: Inclui o warning da API mesmo se houver dados
-    if warning_message: 
-        output_lines.append(f"AVISO DA API EIA: {warning_message}")
-        output_lines.append("") # Linha em branco para melhor formatação
-
-    if actual_data:
-        # Adicionado: Heurística para orientar o LLM sobre dados desagregados
-        first_row_keys = actual_data[0].keys()
-        is_disaggregated_by_state_sector = 'stateid' in first_row_keys and 'sectorid' in first_row_keys
-
-        # Verifica se 'US' ou 'ALL' para stateid foi explicitamente solicitado
-        stateid_filter_values = filters.get('stateid', []) if filters else []
-        requested_national_aggregate = False
-        if isinstance(stateid_filter_values, list):
-            if 'US' in stateid_filter_values or 'ALL' in stateid_filter_values:
-                requested_national_aggregate = True
-        elif isinstance(stateid_filter_values, str):
-            if stateid_filter_values == 'US' or stateid_filter_values == 'ALL':
-                requested_national_aggregate = True
-
-        # Se os dados parecem desagregados e um total nacional não foi explicitamente pedido
-        if is_disaggregated_by_state_sector and not requested_national_aggregate:
-            output_lines.append(
-                "Os dados retornados são desagregados por estado e setor. "
-                "Para obter um total nacional, você pode precisar somar os valores relevantes "
-                "(ex: 'sales' para 'sectorid: ALL') de cada estado, "
-                "ou refinar a busca especificando 'filters={{'stateid': ['US']}}' para obter o agregado nacional (se disponível)."
+🎯 **Para obter dados**, escolha uma sub-rota específica e chame novamente:
+```
+specific_route: "rota-escolhida"
+```
+                """)]
             )
-            output_lines.append("") # Linha em branco para melhor formatação
+        
+        # Fase 3: Se não temos parâmetros suficientes, mostrar metadados
+        if not data_elements:
+            metadata_info = [f"📋 **Metadados para**: `{specific_route}`\n"]
+            
+            if response_content.get('name'):
+                metadata_info.append(f"**Nome**: {response_content['name']}")
+            if response_content.get('description'):
+                metadata_info.append(f"**Descrição**: {response_content['description']}")
+            
+            # Elementos de dados disponíveis
+            data_meta = response_content.get('data', {})
+            if data_meta:
+                metadata_info.append("\n📊 **Elementos de dados disponíveis**:")
+                for col_id, col_info in list(data_meta.items())[:10]:  # Limitar
+                    if isinstance(col_info, dict):
+                        name = col_info.get('name', col_info.get('alias', col_id))
+                        units = col_info.get('units', 'N/A')
+                        metadata_info.append(f"  • `{col_id}`: {name} ({units})")
+                
+                if len(data_meta) > 10:
+                    metadata_info.append(f"  *... e mais {len(data_meta) - 10} elementos*")
+            
+            # Filtros/facets disponíveis
+            facets_meta = response_content.get('facets', [])
+            if facets_meta:
+                metadata_info.append("\n🔍 **Filtros disponíveis**:")
+                for facet in facets_meta[:8]:  # Limitar
+                    facet_id = facet.get('id', 'N/A')
+                    facet_name = facet.get('name', 'N/A')
+                    metadata_info.append(f"  • `{facet_id}`: {facet_name}")
+                
+                if len(facets_meta) > 8:
+                    metadata_info.append(f"  *... e mais {len(facets_meta) - 8} filtros*")
+            
+            # Frequências disponíveis
+            frequencies = response_content.get('frequency', [])
+            if frequencies:
+                freq_list = []
+                for freq in frequencies:
+                    freq_id = freq.get('id', freq.get('query', 'N/A'))
+                    freq_desc = freq.get('description', freq.get('name', ''))
+                    freq_list.append(f"`{freq_id}`" + (f" ({freq_desc})" if freq_desc else ""))
+                metadata_info.append(f"\n📅 **Frequências**: {', '.join(freq_list)}")
+            
+            metadata_info.append(f"""
+🎯 **Para obter dados reais**, chame novamente especificando:
+```
+data_elements: ["value"]  # ou outros elementos disponíveis
+facets: {{"filtro": ["valor"]}}  # opcional
+frequency: "monthly"  # opcional
+start_period: "2020"  # opcional
+end_period: "2023"  # opcional
+```
+            """)
+            
+            return CallToolResult(
+                content=[TextContent(type="text", text="\n".join(metadata_info))]
+            )
+        
+        # Fase 4: Recuperar dados reais
+        data_route = f"{specific_route.rstrip('/')}/data"
+        params = {
+            "length": min(limit, 5000),
+            "offset": 0
+        }
+        
+        # Adicionar parâmetros
+        if data_elements:
+            params["data"] = data_elements
+        if frequency:
+            params["frequency"] = frequency
+        if start_period:
+            params["start"] = start_period
+        if end_period:
+            params["end"] = end_period
+        if facets:
+            params["facets"] = facets
+        if sort_column:
+            params["sort"] = [{"column": sort_column, "direction": sort_direction}]
+        
+        logger.info(f"Requisitando dados de: {data_route}")
+        data_response = await make_eia_api_request(data_route, params, use_cache=False)
+        
+        if not data_response:
+            return CallToolResult(
+                is_error=True, 
+                content=[TextContent(type="text", text=f"❌ Falha na requisição para '{data_route}' - sem resposta")]
+            )
+        
+        if data_response.get("error"):
+            error_details = []
+            error_details.append(f"❌ **Erro ao recuperar dados**: {data_response.get('message', 'Erro desconhecido')}")
+            
+            if data_response.get("data"):
+                error_details.append(f"**Detalhes**: {data_response.get('data')}")
+            
+            # Sugestões baseadas no erro
+            error_msg = str(data_response.get('message', '')).lower()
+            if 'facet' in error_msg:
+                error_details.append("\n💡 **Dica**: Verifique os filtros (facets) disponíveis usando a ferramenta `get_facet_values()`")
+            elif 'frequency' in error_msg:
+                error_details.append("\n💡 **Dica**: Verifique as frequências disponíveis nos metadados")
+            elif 'data' in error_msg:
+                error_details.append("\n💡 **Dica**: Verifique os elementos de dados disponíveis nos metadados")
+            
+            return CallToolResult(
+                is_error=True, 
+                content=[TextContent(type="text", text="\n".join(error_details))]
+            )
+        
+        response_data = data_response.get('response', {})
+        actual_data = response_data.get('data', [])
+        
+        if not actual_data:
+            suggestion_text = f"""
+❌ **Nenhum dado encontrado** para os critérios especificados.
 
-        # Cabeçalho da tabela
-        columns = list(actual_data[0].keys())
-        header_line = "| " + " | ".join(columns) + " |"
-        separator_line = "|" + "---|".join(["---"] * len(columns)) + "|"
-        output_lines.extend([header_line, separator_line])
+**Parâmetros utilizados**:
+- Rota: `{data_route}`
+- Elementos: `{data_elements}`
+- Filtros: `{facets}`
+- Frequência: `{frequency}`
+- Período: `{start_period}` até `{end_period}`
+
+💡 **Sugestões**:
+1. Tente ampliar o período de tempo
+2. Remova alguns filtros específicos
+3. Verifique se os valores dos filtros estão corretos
+4. Use a ferramenta `get_facet_values()` para ver opções válidas
+            """
+            return CallToolResult(
+                content=[TextContent(type="text", text=suggestion_text)]
+            )
         
-        # Dados da tabela (limitado a 50 linhas para evitar overflow)
-        display_data = actual_data[:50]
-        for row in display_data:
-            row_values = [str(row.get(col, 'N/A')) for col in columns]
-            output_lines.append("| " + " | ".join(row_values) + " |")
+        # Formatação aprimorada dos resultados
+        total_records = response_data.get('total', len(actual_data))
         
-        if len(actual_data) > 50:
-            output_lines.append(f"... e mais {len(actual_data) - 50} registros")
+        output_lines = [
+            f"📊 **Dados de Energia**: {response_content.get('name', specific_route)}",
+            f"🔍 **Consulta**: {query}",
+            f"📈 **Total de registros**: {total_records:,} (mostrando {len(actual_data):,})",
+        ]
+        
+        # Adicionar informações sobre parâmetros usados
+        if facets:
+            facet_info = []
+            for k, v in facets.items():
+                if isinstance(v, list):
+                    facet_info.append(f"{k}: {', '.join(map(str, v))}")
+                else:
+                    facet_info.append(f"{k}: {v}")
+            output_lines.append(f"🔍 **Filtros aplicados**: {'; '.join(facet_info)}")
+        
+        if frequency:
+            output_lines.append(f"📅 **Frequência**: {frequency}")
+        if start_period or end_period:
+            period_info = f"{start_period or 'início'} até {end_period or 'fim'}"
+            output_lines.append(f"📆 **Período**: {period_info}")
+        
+        output_lines.append("")  # Linha em branco
+        
+        # Tabela de dados
+        output_lines.extend(format_data_table(actual_data, max_rows=50))
         
         # Informações adicionais
-        output_lines.append("")
-        output_lines.append("Informações sobre os dados:")
         if response_content.get('description'):
-            output_lines.append(f"- Descrição: {response_content['description']}")
-        if response_data.get('total', 0) > len(actual_data):
-            output_lines.append(f"- Dados paginados: apenas {len(actual_data)} de {response_data['total']} registros mostrados")
+            output_lines.append(f"\n📝 **Sobre os dados**: {response_content['description']}")
+        
+        if total_records > len(actual_data):
+            output_lines.append(f"\n⚠️ **Dados paginados**: Use `limit` maior ou implemente paginação para ver todos os {total_records:,} registros")
+        
+        return CallToolResult(
+            content=[TextContent(type="text", text="\n".join(output_lines))]
+        )
     
-    # Adicionado: Adiciona a URL da API (sem API Key) para que o LLM possa debuggar ou re-testar se necessário
-    debug_params = {k: v for k, v in params.items() if k != 'api_key'}
-    full_url_with_params = f"{full_url.split('?')[0]}?{urlencode(debug_params)}"
-    output_lines.append(f"URL da API (sem API Key): {full_url_with_params}")
-
-    return CallToolResult(
-        content=[TextContent(type="text", text="\n".join(output_lines))]
-    )
+    except Exception as e:
+        logger.error(f"Erro inesperado em search_energy_data: {e}")
+        return CallToolResult(
+            is_error=True,
+            content=[TextContent(type="text", text=f"❌ Erro inesperado: {str(e)}")]
+        )
 
 @mcp.tool()
-async def get_facet_values(route: str, facet_id: str) -> CallToolResult:
+async def get_facet_values(route: str, facet_id: str, limit: int = 100) -> CallToolResult:
     """
-    Obtém os valores disponíveis para um facet específico em uma rota.
+    Obtém os valores disponíveis para um filtro específico.
     
     Args:
         route: Rota da EIA (ex: "electricity/retail-sales")
-        facet_id: ID do facet (ex: "stateid", "sectorid")
+        facet_id: ID do filtro (ex: "stateid", "sectorid")
+        limit: Limite de valores retornados (padrão: 100)
     """
-    facet_route = f"{route.rstrip('/')}/facet/{facet_id}"
+    try:
+        facet_route = f"{route.rstrip('/')}/facet/{facet_id}"
+        
+        response = await make_eia_api_request(facet_route, {"length": limit})
+        
+        if not response or response.get("error"):
+            error_msg = response.get('message', 'Erro desconhecido') if response else 'Sem resposta'
+            return CallToolResult(
+                is_error=True,
+                content=[TextContent(type="text", text=f"❌ Erro ao obter valores do filtro '{facet_id}' na rota '{route}': {error_msg}")]
+            )
+        
+        response_content = response.get('response', response)
+        facet_values = response_content.get('facets', [])
+        
+        if not facet_values:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"❌ Nenhum valor encontrado para o filtro '{facet_id}' na rota '{route}'.")]
+            )
+        
+        total_facets = response_content.get('totalFacets', len(facet_values))
+        
+        output_lines = [
+            f"🔍 **Valores disponíveis para o filtro `{facet_id}`**",
+            f"📂 **Rota**: `{route}`",
+            f"📊 **Total**: {total_facets:,} valores (mostrando {len(facet_values):,})",
+            ""
+        ]
+        
+        # Agrupar valores por categoria se possível
+        values_info = []
+        for value in facet_values:
+            value_id = value.get('id', 'N/A')
+            value_name = value.get('name', 'N/A')
+            alias = value.get('alias', '')
+            
+            line = f"• **{value_id}**: {value_name}"
+            if alias and alias != value_name and alias != value_id:
+                line += f" _{alias}_"
+            values_info.append(line)
+        
+        output_lines.extend(values_info)
+        
+        if total_facets > len(facet_values):
+            output_lines.append(f"\n⚠️ **Mostrando apenas {len(facet_values)} de {total_facets} valores**. Use `limit` maior para ver mais.")
+        
+        # Exemplo de uso
+        output_lines.append(f"""
+💡 **Exemplo de uso**:
+```
+facets: {{"{facet_id}": ["{facet_values[0].get('id', 'VALUE')}"]}}
+```
+        """)
+        
+        return CallToolResult(
+            content=[TextContent(type="text", text="\n".join(output_lines))]
+        )
     
-    response = await make_eia_api_request(facet_route, {})
-    
-    if not response or response.get("error"):
+    except Exception as e:
+        logger.error(f"Erro em get_facet_values: {e}")
         return CallToolResult(
             is_error=True,
-            content=[TextContent(type="text", text=f"Erro ao obter valores do facet '{facet_id}' na rota '{route}': {response.get('message', 'Erro desconhecido')}")]
+            content=[TextContent(type="text", text=f"❌ Erro inesperado: {str(e)}")]
         )
-    
-    response_content = response.get('response', response)
-    facet_values = response_content.get('facets', [])
-    
-    if not facet_values:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Nenhum valor encontrado para o facet '{facet_id}' na rota '{route}'.")]
-        )
-    
-    output_lines = [
-        f"Valores disponíveis para o facet '{facet_id}' na rota '{route}':",
-        f"Total: {response_content.get('totalFacets', len(facet_values))}",
-        ""
-    ]
-    
-    for value in facet_values:
-        value_id = value.get('id', 'N/A')
-        value_name = value.get('name', 'N/A')
-        alias = value.get('alias', '')
-        
-        line = f"- {value_id}: {value_name}"
-        if alias and alias != value_name:
-            line += f" ({alias})"
-        output_lines.append(line)
-    
-    return CallToolResult(
-        content=[TextContent(type="text", text="\n".join(output_lines))]
-    )
 
 @mcp.tool()
-async def get_series_data(series_id: str, start: Optional[str] = None, end: Optional[str] = None) -> CallToolResult:
+async def get_series_data(series_id: str, start: Optional[str] = None, end: Optional[str] = None, limit: int = 1000) -> CallToolResult:
     """
-    Obtém dados usando Series ID da API v1 (compatibilidade reversa).
+    Obtém dados de uma série específica da EIA usando o ID da série.
     
     Args:
-        series_id: ID da série (ex: "ELEC.SALES.US-ALL.A")
-        start: Data de início (ex: "2020")
-        end: Data de fim (ex: "2023")
+        series_id: ID da série (ex: "ELEC.GEN.ALL-US-99.M")
+        start: Data de início (ex: "2020-01", "2020")
+        end: Data de fim (ex: "2023-12", "2023")
+        limit: Número máximo de registros (padrão: 1000)
     """
-    route_path = f"seriesid/{series_id}"
-    params = {}
-    
-    if start:
-        params["start"] = start
-    if end:
-        params["end"] = end
-    
-    response = await make_eia_api_request(route_path, params)
-    
-    if not response or response.get("error"):
-        return CallToolResult(
-            is_error=True,
-            content=[TextContent(type="text", text=f"Erro ao obter dados da série '{series_id}': {response.get('message', 'Erro desconhecido')}")]
-        )
-    
-    response_content = response.get('response', {})
-    data = response_content.get('data', [])
-    
-    if not data:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Nenhum dado encontrado para a série '{series_id}'.")]
-        )
-    
-    output_lines = [
-        f"Dados da Série: {series_id}",
-        f"Total de registros: {len(data)}",
-        ""
-    ]
-    
-    # Formatação dos dados da série
-    columns = list(data[0].keys()) if data else []
-    if columns:
-        header_line = "| " + " | ".join(columns) + " |"
-        separator_line = "|" + "---|".join(["---"] * len(columns)) + "|"
-        output_lines.extend([header_line, separator_line])
+    try:
+        series_route = f"seriesid/{series_id}"
+        params = {"length": min(limit, 5000)}
         
-        for row in data:
-            row_values = [str(row.get(col, 'N/A')) for col in columns]
-            output_lines.append("| " + " | ".join(row_values) + " |")
-    
-    return CallToolResult(
-        content=[TextContent(type="text", text="\n".join(output_lines))]
-    )
-
-# --- Ferramenta para Teste Direto ---
-@mcp.tool()
-async def test_direct_api_call(url_path: str, params_dict: Optional[Dict[str, Any]] = None) -> CallToolResult:
-    """
-    Ferramenta para teste direto de chamadas da API EIA.
-    Use para debug e testes específicos.
-    
-    Args:
-        url_path: Caminho da URL (ex: "petroleum/crd/crpdn/data/")
-        params_dict: Parâmetros como dicionário
-    """
-    if params_dict is None:
-        params_dict = {}
-    
-    logger.info(f"Teste direto - URL: {url_path}")
-    logger.info(f"Teste direto - Parâmetros: {params_dict}")
-    
-    response = await make_eia_api_request(url_path, params_dict)
-    
-    if not response:
+        if start:
+            params["start"] = start
+        if end:
+            params["end"] = end
+        
+        response = await make_eia_api_request(series_route, params, use_cache=False)
+        
+        if not response or response.get("error"):
+            error_msg = response.get('message', 'Erro desconhecido') if response else 'Sem resposta'
+            return CallToolResult(
+                is_error=True,
+                content=[TextContent(type="text", text=f"❌ Erro ao obter dados da série '{series_id}': {error_msg}")]
+            )
+        
+        response_content = response.get('response', response)
+        series_data = response_content.get('data', [])
+        
+        if not series_data:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"❌ Nenhum dado encontrado para a série '{series_id}' no período especificado.")]
+            )
+        
+        # Obter metadados da série
+        series_info = series_data[0] if series_data else {}
+        series_name = series_info.get('name', series_id)
+        series_description = series_info.get('description', '')
+        series_units = series_info.get('units', 'N/A')
+        data_points = series_info.get('data', [])
+        
+        output_lines = [
+            f"📈 **Série**: {series_name}",
+            f"🆔 **ID**: `{series_id}`",
+            f"📊 **Pontos de dados**: {len(data_points):,}",
+            f"📏 **Unidade**: {series_units}",
+        ]
+        
+        if series_description:
+            output_lines.append(f"📝 **Descrição**: {series_description}")
+        
+        if start or end:
+            period_info = f"{start or 'início'} até {end or 'fim'}"
+            output_lines.append(f"📆 **Período**: {period_info}")
+        
+        output_lines.append("")  # Linha em branco
+        
+        if data_points:
+            # Formatar dados como tabela
+            formatted_data = []
+            for point in data_points:
+                if len(point) >= 2:
+                    period = point[0]
+                    value = point[1]
+                    # Formatação especial para valores numéricos
+                    if isinstance(value, (int, float)) and abs(value) >= 1000:
+                        formatted_value = f"{value:,.2f}" if isinstance(value, float) else f"{value:,}"
+                    else:
+                        formatted_value = str(value)
+                    formatted_data.append({"Período": period, "Valor": formatted_value, "Unidade": series_units})
+            
+            # Mostrar tabela
+            if formatted_data:
+                output_lines.extend(format_data_table(formatted_data[:50]))
+                
+                if len(data_points) > 50:
+                    output_lines.append(f"\n*Mostrando 50 de {len(data_points)} registros*")
+        
         return CallToolResult(
-            is_error=True,
-            content=[TextContent(type="text", text="Falha na requisição - sem resposta")]
+            content=[TextContent(type="text", text="\n".join(output_lines))]
         )
     
-    # Retornar resposta bruta para análise
-    response_str = json.dumps(response, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Erro em get_series_data: {e}")
+        return CallToolResult(
+            is_error=True,
+            content=[TextContent(type="text", text=f"❌ Erro inesperado: {str(e)}")]
+        )
+
+@mcp.tool()
+async def discover_energy_routes(category: Optional[str] = None) -> CallToolResult:
+    """
+    Descobre e lista todas as rotas disponíveis na API da EIA, opcionalmente filtradas por categoria.
     
-    return CallToolResult(
-        content=[TextContent(type="text", text=f"Resposta da API:\n\n{response_str}")]
-    )
+    Args:
+        category: Categoria para filtrar (ex: "electricity", "petroleum", "natural-gas")
+    """
+    try:
+        response = await make_eia_api_request("", {})
+        
+        if not response or response.get("error"):
+            error_msg = response.get('message', 'Erro desconhecido') if response else 'Sem resposta'
+            return CallToolResult(
+                is_error=True,
+                content=[TextContent(type="text", text=f"❌ Erro ao descobrir rotas: {error_msg}")]
+            )
+        
+        routes_data = response.get('response', {}).get('routes', [])
+        
+        if not routes_data:
+            return CallToolResult(
+                content=[TextContent(type="text", text="❌ Nenhuma rota encontrada.")]
+            )
+        
+        # Filtrar por categoria se especificada
+        if category:
+            filtered_routes = [r for r in routes_data if category.lower() in r.get('id', '').lower()]
+            if not filtered_routes:
+                available_categories = list(set([r.get('id', '').split('/')[0] for r in routes_data if '/' not in r.get('id', '')]))
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"❌ Categoria '{category}' não encontrada.\n\n📂 **Categorias disponíveis**: {', '.join(sorted(available_categories))}")]
+                )
+            routes_data = filtered_routes
+        
+        output_lines = [
+            f"🗂️ **Rotas da API EIA v2**" + (f" - Categoria: {category}" if category else ""),
+            f"📊 **Total**: {len(routes_data)} rotas",
+            ""
+        ]
+        
+        # Agrupar rotas por categoria principal
+        categories = {}
+        for route in routes_data:
+            route_id = route.get('id', 'N/A')
+            route_name = route.get('name', 'N/A')
+            route_desc = route.get('description', '')
+            
+            # Determinar categoria principal
+            main_category = route_id.split('/')[0] if '/' in route_id else route_id
+            
+            if main_category not in categories:
+                categories[main_category] = []
+            
+            route_info = f"  • **{route_id}**: {route_name}"
+            if route_desc:
+                route_info += f"\n    ↳ _{route_desc}_"
+            
+            categories[main_category].append(route_info)
+        
+        # Mostrar categorias organizadas
+        for cat_name, cat_routes in sorted(categories.items()):
+            output_lines.append(f"## 📁 {cat_name.upper()}")
+            output_lines.extend(cat_routes[:10])  # Limitar para não sobrecarregar
+            
+            if len(cat_routes) > 10:
+                output_lines.append(f"    *... e mais {len(cat_routes) - 10} rotas*")
+            
+            output_lines.append("")  # Linha em branco entre categorias
+        
+        output_lines.append("""
+💡 **Próximos passos**:
+1. Use `search_energy_data()` com uma rota específica
+2. Use `get_facet_values()` para ver filtros disponíveis
+3. Use `get_series_data()` se tiver um ID de série específico
 
-# --- Recursos ---
-@mcp.resource(uri="eia://guide", name="Guia do Servidor EIA", description="Guia completo para usar o servidor MCP da EIA")
-async def get_eia_guide() -> Resource:
-    content = """
-# Guia do Servidor MCP da EIA
+**Exemplo**: `search_energy_data(specific_route="electricity/retail-sales")`
+        """)
+        
+        return CallToolResult(
+            content=[TextContent(type="text", text="\n".join(output_lines))]
+        )
+    
+    except Exception as e:
+        logger.error(f"Erro em discover_energy_routes: {e}")
+        return CallToolResult(
+            is_error=True,
+            content=[TextContent(type="text", text=f"❌ Erro inesperado: {str(e)}")]
+        )
 
-## Visão Geral
-Este servidor fornece acesso simplificado aos dados energéticos da EIA (Energy Information Administration) dos EUA.
+# --- Recursos (Resources) ---
+@mcp.resource("eia://energy-concepts")
+async def get_energy_concepts() -> Resource:
+    """Retorna informações sobre conceitos energéticos e mapeamento de palavras-chave."""
+    concepts_text = """# Conceitos Energéticos - EIA
 
-## Ferramentas Disponíveis
+## Mapeamento de Conceitos
 
-### 1. search_energy_data()
-A ferramenta principal e mais inteligente. Use esta para:
-- Buscar qualquer tipo de dado energético
-- Descobrir automaticamente rotas relevantes
-- Explorar metadados e opções disponíveis
-- Recuperar dados reais
+### Eletricidade
+- **Palavras-chave**: eletricidade, energia elétrica, consumo energia, geração energia, preço energia, electricity, power, grid
+- **Rotas principais**: electricity, electricity/retail-sales, electricity/electric-power-operational-data
 
-**Exemplos de uso:**
-- `search_energy_data(query="consumo de eletricidade residencial")`
-- `search_energy_data(query="preços do petróleo", specific_route="petroleum")`
-- `search_energy_data(query="geração solar", specific_route="electricity/electric-power-operational-data", data_elements=["generation"], filters={"fueltypeid": ["SUN"]})`
+### Petróleo
+- **Palavras-chave**: petróleo, gasolina, diesel, crude oil, combustível, refino, petroleum, oil, gasoline, refineries
+- **Rotas principais**: petroleum, petroleum/crd/crpdn, petroleum/supply/weekly
 
-### 2. get_facet_values()
-Para obter valores específicos de filtros:
-- `get_facet_values(route="electricity/retail-sales", facet_id="stateid")` - Estados disponíveis
-- `get_facet_values(route="electricity/retail-sales", facet_id="sectorid")` - Setores disponíveis
+### Gás Natural
+- **Palavras-chave**: gás natural, gas natural, lng, pipeline, natural gas, methane
+- **Rotas principais**: natural-gas, natural-gas/prod, natural-gas/cons
 
-### 3. get_series_data()
-Para compatibilidade com Series IDs da API v1:
-- `get_series_data(series_id="ELEC.SALES.US-ALL.A")`
+### Carvão
+- **Palavras-chave**: carvão, coal, mineração carvão, carbon, mining
+- **Rotas principais**: coal, coal/production, coal/consumption
 
-### 4. test_direct_api_call()
-Para testes e debug diretos:
-- `test_direct_api_call(url_path="petroleum/crd/crpdn/data/", params_dict={"frequency": "monthly", "data": ["value"]})`
+### Energias Renováveis
+- **Palavras-chave**: renovável, solar, eólica, hidráulica, biomassa, renewable, wind, hydro, geothermal
+- **Rotas principais**: electricity/electric-power-operational-data, renewable
 
-## Correções Implementadas
+### Nuclear
+- **Palavras-chave**: nuclear, uranium, reactor, nuclear power
+- **Rotas principais**: nuclear, nuclear/fuel-cycle
 
-1. **Formatação de Parâmetros**: Arrays agora são formatados corretamente como `data[0]=value`
-2. **Timeout Aumentado**: Para requisições mais longas
-3. **Logging Melhorado**: Para debug detalhado
-4. **Tratamento de Erros**: Mais robusto e informativo
-5. **Ordenação Padrão**: Incluída automaticamente
-6. **Retorno de Avisos da API EIA**: O MCP agora repassa mensagens de 'warning' da API.
-7. **Orientação para Agregação Nacional**: Se os dados são desagregados e um total nacional é implicado, o MCP orienta o LLM.
-8. **URL de Debug**: A URL completa da API (sem a chave) é incluída para depuração.
+### Energia Total
+- **Palavras-chave**: energia total, consumo total, balanço energético, total energy, energy balance
+- **Rotas principais**: total-energy, total-energy/data
 
-## Fluxo Recomendado
-
-1. **Início Exploratório**: Use `search_energy_data()` com uma consulta geral
-2. **Refinamento**: Use as informações retornadas para especificar rotas e parâmetros
-3. **Obtenção de Dados**: Chame novamente com parâmetros específicos para dados reais
-4. **Debug**: Use `test_direct_api_call()` se algo não funcionar
-
-## Categorias Principais de Dados
-
-- **Eletricidade**: Geração, consumo, preços, capacidade
-- **Petróleo**: Produção, refino, preços, estoques (incluindo petroleum/crd/crpdn)
-- **Gás Natural**: Produção, consumo, preços, capacidade
-- **Carvão**: Produção, consumo, preços
-- **Energia Renovável**: Solar, eólica, hidráulica
-- **Energia Total**: Balanços energéticos, estatísticas consolidadas
-
-## Dicas
-
-- Use termos em português ou inglês nas consultas
-- Seja específico sobre localização (estado, região) quando relevante
-- Especifique período de tempo quando necessário
-- Use filtros para refinar resultados (por estado, setor, tipo de combustível, etc.)
-- Para debug, use a ferramenta `test_direct_api_call()`
+### Internacional
+- **Palavras-chave**: internacional, world, global, countries, export, import
+- **Rotas principais**: international
 """
     
     return Resource(
-        uri="eia://guide",
-        name="Guia do Servidor EIA",
-        mime_type="text/markdown",
-        text=content
+        uri="eia://energy-concepts",
+        name="Conceitos Energéticos EIA",
+        description="Mapeamento de conceitos energéticos e palavras-chave para descoberta automática de rotas",
+        mimeType="text/markdown",
+        text=concepts_text
     )
 
 # --- Prompts ---
 @mcp.prompt()
-async def energy_data_assistant() -> GetPromptResult:
-    """Assistente especializado em dados energéticos da EIA."""
+async def energy_analysis_prompt(
+    topic: str,
+    geographic_scope: str = "US",
+    time_period: str = "recent",
+    analysis_type: str = "overview"
+) -> GetPromptResult:
+    """
+    Gera um prompt estruturado para análise de dados energéticos.
+    
+    Args:
+        topic: Tópico energético (ex: "electricity consumption", "oil prices")
+        geographic_scope: Escopo geográfico (ex: "US", "Texas", "California", "regional")
+        time_period: Período temporal (ex: "recent", "2020-2023", "historical")
+        analysis_type: Tipo de análise (ex: "overview", "trends", "comparison", "forecast")
+    """
+    
+    prompt_text = f"""# Análise de Dados Energéticos - {topic.title()}
+
+## Contexto da Análise
+- **Tópico**: {topic}
+- **Escopo Geográfico**: {geographic_scope}
+- **Período**: {time_period}
+- **Tipo de Análise**: {analysis_type}
+
+## Objetivos da Análise
+1. Identificar tendências principais nos dados de {topic}
+2. Analisar padrões sazonais ou cíclicos
+3. Comparar diferentes regiões/setores quando aplicável
+4. Identificar fatores que influenciam as variações
+5. Fornecer insights acionáveis
+
+## Passos Recomendados
+1. **Descoberta de Dados**: Use `search_energy_data()` para encontrar dados relevantes sobre {topic}
+2. **Exploração**: Examine metadados e filtros disponíveis
+3. **Coleta**: Obtenha dados específicos com parâmetros adequados
+4. **Análise**: Identifique padrões, tendências e anomalias
+5. **Interpretação**: Contextualize os resultados com fatores externos
+
+## Considerações Especiais
+- Atenção a unidades de medida e conversões
+- Verificação de dados sazonalmente ajustados vs. não ajustados
+- Comparação com benchmarks históricos
+- Impacto de eventos externos (crises, políticas, clima)
+
+## Formato de Resultado Esperado
+- Resumo executivo dos principais achados
+- Visualizações ou tabelas dos dados chave
+- Análise de tendências com explicações
+- Recomendações ou insights para tomada de decisão
+"""
+    
     return GetPromptResult(
-        description="Assistente para análise de dados energéticos dos EUA usando a API da EIA",
+        name=f"energy_analysis_{topic.replace(' ', '_')}",
+        description=f"Prompt estruturado para análise de {topic}",
         messages=[
-            {
-                "role": "system", 
-                "content": TextContent(
-                    type="text", 
-                    text="""Você é um assistente especializado em dados energéticos dos EUA, com acesso à API da EIA através do servidor MCP.
-
-Use a ferramenta search_energy_data() como ponto de partida para qualquer consulta. Esta ferramenta é inteligente e pode:
-1. Descobrir automaticamente rotas relevantes
-2. Explorar metadados quando necessário
-3. Recuperar dados reais quando os parâmetros estão completos
-
-Sempre comece com consultas gerais e vá refinando conforme necessário. Seja proativo em sugerir filtros e parâmetros úteis baseados no contexto da pergunta do usuário.
-
-Se a API retornar um aviso (AVISO DA API EIA), informe o usuário sobre ele.
-
-Quando dados desagregados (por estado/setor) forem retornados, e a pergunta implicar um total nacional, lembre o usuário de que os dados precisam ser agregados ou que ele pode tentar especificar 'stateid': 'US' para um total direto, se a API o suportar para essa rota.
-
-Se algo não funcionar, use a ferramenta test_direct_api_call() para debug."""
-                )
-            }
+            {"role": "user", "content": {"type": "text", "text": prompt_text}}
         ]
     )
 
-# --- Função Principal ---
+# --- Execução do Servidor ---
 if __name__ == "__main__":
-    logger.info("Iniciando servidor MCP da EIA melhorado...")
+    logger.info(f"🚀 Iniciando EIA Energy Data MCP Server v2.1 na porta {PORT}")
+    logger.info(f"🔑 API Key configurada: {'✅' if EIA_API_KEY else '❌'}")
+    logger.info(f"📊 Conceitos mapeados: {len(CONCEPT_MAPPING)}")
     
     try:
         mcp.run(transport="sse")
+    except KeyboardInterrupt:
+        logger.info("🛑 Servidor interrompido pelo usuário")
     except Exception as e:
-        logger.error(f"Erro ao iniciar servidor: {e}")
+        logger.error(f"❌ Erro fatal: {e}")
         sys.exit(1)
