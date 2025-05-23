@@ -114,8 +114,9 @@ def format_eia_params(params: Dict[str, Any]) -> Dict[str, Any]:
                     for sort_key, sort_value in sort_item.items():
                         formatted_params[f"sort[{i}][{sort_key}]"] = sort_value
         elif isinstance(value, list) and key not in ["facets", "data", "sort"]:
-            # Para outros arrays, usar formato simples
-            formatted_params[key] = ",".join(map(str, value))
+            # CORREÇÃO: Verificar se a lista não está vazia antes do join
+            if value:  # Só fazer join se a lista não estiver vazia
+                formatted_params[key] = ",".join(map(str, value))
         else:
             formatted_params[key] = value
     
