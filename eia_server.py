@@ -239,10 +239,28 @@ def format_data_table(data: List[Dict], max_rows: int = 50) -> List[str]:
         row_values = []
         for col in columns:
             value = row.get(col, 'N/A')
+            if isinstance(value, str):
+                try:
+                    # Tenta converter para float se houver ponto decimal, senão para int
+                    if '.' in value:
+                        converted_value = float(value)
+                    else:
+                        converted_value = int(value)
+                    # Se a conversão for bem-sucedida, use o valor convertido
+                    value = converted_value
+                except ValueError:
+                    # Se não puder converter para número, mantém como string
+                    pass
             # Formatação especial para números
-            if isinstance(value, (int, float)) and abs(value) >= 1000:
-                value = f"{value:,.2f}" if isinstance(value, float) else f"{value:,}"
-            row_values.append(str(value))
+            if isinstance(value, (int, float)):
+                if abs(value) >= 1000:
+                    formatted_value = f"{value:,.2f}" if isinstance(value, float) else f"{value:,}"
+                else:
+                    formatted_value = str(value) # Mantém números menores como string simples
+            else:
+                formatted_value = str(value) # Para valores não numéricos (como texto)
+
+            row_values.append(formatted_value)
         output_lines.append("| " + " | ".join(row_values) + " |")
     
     if len(data) > max_rows:
@@ -536,7 +554,16 @@ end_period: "2023" # opcional
             )
         
         # Formatação aprimorada dos resultados
-        total_records = response_data.get('total', len(actual_data))
+        total_records = response_data.get('total')
+        # Adicione este bloco para garantir que total_records é um int
+        if total_records is not None:
+            try:
+                total_records = int(total_records)
+            except ValueError:
+                logger.warning(f"Total records received as non-integer: {total_records}. Falling back to len(actual_data).")
+                total_records = len(actual_data)
+        else:
+            total_records = len(actual_data)
         
         output_lines = [
             f"📊 **Dados de Energia**: {response_content.get('name', specific_route)}",
