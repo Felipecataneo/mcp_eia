@@ -8,6 +8,9 @@ from dotenv import load_dotenv
 import logging
 import json
 from urllib.parse import urlencode
+import re
+from datetime import datetime
+import asyncio
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -62,10 +65,25 @@ CONCEPT_MAPPING = {
     }
 }
 
+# --- Mapeamento de estados ---
+STATE_MAPPING = {
+    'alabama': 'AL', 'alaska': 'AK', 'arizona': 'AZ', 'arkansas': 'AR', 'california': 'CA',
+    'colorado': 'CO', 'connecticut': 'CT', 'delaware': 'DE', 'florida': 'FL', 'georgia': 'GA',
+    'hawaii': 'HI', 'idaho': 'ID', 'illinois': 'IL', 'indiana': 'IN', 'iowa': 'IA',
+    'kansas': 'KS', 'kentucky': 'KY', 'louisiana': 'LA', 'maine': 'ME', 'maryland': 'MD',
+    'massachusetts': 'MA', 'michigan': 'MI', 'minnesota': 'MN', 'mississippi': 'MS', 'missouri': 'MO',
+    'montana': 'MT', 'nebraska': 'NE', 'nevada': 'NV', 'new hampshire': 'NH', 'new jersey': 'NJ',
+    'new mexico': 'NM', 'new york': 'NY', 'north carolina': 'NC', 'north dakota': 'ND', 'ohio': 'OH',
+    'oklahoma': 'OK', 'oregon': 'OR', 'pennsylvania': 'PA', 'rhode island': 'RI', 'south carolina': 'SC',
+    'south dakota': 'SD', 'tennessee': 'TN', 'texas': 'TX', 'utah': 'UT', 'vermont': 'VT',
+    'virginia': 'VA', 'washington': 'WA', 'west virginia': 'WV', 'wisconsin': 'WI', 'wyoming': 'WY'
+}
+
 # --- Cache simples para metadados ---
 metadata_cache = {}
 
 # --- Inicialização do Servidor MCP ---
+# Esta é a instância da sua aplicação FastMCP. O Uvicorn a carregará.
 mcp = FastMCP(
     name="eia-energy-data",
     host="0.0.0.0",
@@ -222,6 +240,74 @@ def extract_frequencies(metadata: Dict[str, Any]) -> List[Dict[str, str]]:
         }
         for freq in frequencies
     ]
+
+def parse_query_filters(query: str) -> Dict[str, Any]:
+    """Analisa a query e extrai filtros automaticamente."""
+    query_lower = query.lower()
+    filters = {}
+    
+    # Estados
+    for state_name, state_code in STATE_MAPPING.items():
+        if state_name in query_lower:
+            filters['stateid'] = [state_code]
+            break
+    
+    # Setores
+    if 'residencial' in query_lower or 'residential' in query_lower:
+        filters['sectorid'] = ['RES']
+    elif 'industrial' in query_lower:
+        filters['sectorid'] = ['IND']
+    elif 'comercial' in query_lower or 'commercial' in query_lower:
+        filters['sectorid'] = ['COM']
+    elif 'transporte' in query_lower or 'transportation' in query_lower:
+        filters['sectorid'] = ['TRA']
+    
+    # Combustíveis para energia elétrica
+    if 'solar' in query_lower:
+        filters['fueltypeid'] = ['SUN']
+    elif 'eólica' in query_lower or 'wind' in query_lower:
+        filters['fueltypeid'] = ['WND']
+    elif 'nuclear' in query_lower:
+        filters['fueltypeid'] = ['NUC']
+    elif 'carvão' in query_lower or 'coal' in query_lower:
+        filters['fueltypeid'] = ['COL']
+    elif 'gás natural' in query_lower or 'natural gas' in query_lower:
+        filters['fueltypeid'] = ['NG']
+    
+    return filters
+
+def parse_query_periods(query: str) -> Dict[str, str]:
+    """Extrai períodos da query."""
+    periods = {}
+    
+    # Buscar anos (formato 2XXX)
+    years = re.findall(r'\b20\d{2}\b', query)
+    if years:
+        periods['start'] = years[0]
+        if len(years) > 1:
+            periods['end'] = years[-1]
+    
+    # Buscar meses (formato YYYY-MM)
+    months = re.findall(r'\b20\d{2}-\d{2}\b', query)
+    if months:
+        periods['start'] = months[0]
+        if len(months) > 1:
+            periods['end'] = months[-1]
+    
+    return periods
+
+def determine_frequency(query: str) -> str:
+    """Determina a frequência baseada na query."""
+    query_lower = query.lower()
+    
+    if any(word in query_lower for word in ['mensal', 'monthly', 'mês', 'month']):
+        return 'monthly'
+    elif any(word in query_lower for word in ['trimestral', 'quarterly', 'trimestre', 'quarter']):
+        return 'quarterly'
+    elif any(word in query_lower for word in ['anual', 'annual', 'ano', 'year']):
+        return 'annual'
+    else:
+        return 'annual'  # Default
 
 # --- Ferramentas Otimizadas ---
 @mcp.tool()
@@ -429,9 +515,11 @@ async def get_energy_data(
         if warning_message:
             msg += f"\n\nAVISO DA API EIA: {warning_message}"
         
-        # URL para debug
-        debug_params = {k: v for k, v in params.items()}
-        debug_url = f"{EIA_API_BASE_URL}/{data_route}?" + urlencode(debug_params, doseq=True)
+        # Gerar URL para debug manualmente para garantir formato correto
+        debug_params = format_eia_params({k: v for k, v in params.items() if k != 'api_key'})
+        query_string = urlencode(debug_params, doseq=True)
+        debug_url = f"{EIA_API_BASE_URL}/{data_route.lstrip('/')}?{query_string}"
+        
         msg += f"\n\nURL de debug (sem API key): {debug_url}"
         
         return CallToolResult(
@@ -605,421 +693,254 @@ async def smart_energy_search(
         params = {
             'route': route,
             'data_elements': common_elements[:2],  # Máximo 2 elementos
-            'frequency': 'annual',  # Começar com anual
+            'frequency': determine_frequency(query),
             'limit': 50  # Limite menor para primeiro teste
         }
         
-        # Tentar detectar filtros da query
-        query_lower = query.lower()
+        # Aplicar filtros automáticos
+        auto_filters = parse_query_filters(query)
+        if auto_filters: # <-- Linha corrigida/completada
+            params['filters'] = auto_filters
         
-        # Estados
-        state_mapping = {
-            'texas': 'TX', 'california': 'CA', 'florida': 'FL', 'new york': 'NY',
-            'illinois': 'IL', 'pennsylvania': 'PA', 'ohio': 'OH', 'georgia': 'GA',
-            'north carolina': 'NC', 'michigan': 'MI'
-        }
-        
-        for state_name, state_code in state_mapping.items():
-            if state_name in query_lower:
-                params['filters'] = {'stateid': [state_code]}
-                break
-        
-        # Setores
-        if 'residencial' in query_lower or 'residential' in query_lower:
-            if 'filters' not in params:
-                params['filters'] = {}
-            params['filters']['sectorid'] = ['RES']
-        elif 'industrial' in query_lower:
-            if 'filters' not in params:
-                params['filters'] = {}
-            params['filters']['sectorid'] = ['IND']
-        elif 'comercial' in query_lower or 'commercial' in query_lower:
-            if 'filters' not in params:
-                params['filters'] = {}
-            params['filters']['sectorid'] = ['COM']
-        
-        # Períodos
-        import re
-        years = re.findall(r'\b20\d{2}\b', query)
-        if years:
-            params['start_period'] = years[0]
-            if len(years) > 1:
-                params['end_period'] = years[-1]
-        
-        # Obter dados
+        # Aplicar períodos automáticos
+        auto_periods = parse_query_periods(query)
+        if auto_periods.get('start'): # <-- Linha corrigida/completada
+            params['start_period'] = auto_periods['start']
+        if auto_periods.get('end'): # <-- Linha corrigida/completada
+            params['end_period'] = auto_periods['end']
+            
+        # Call get_energy_data
         data_result = await get_energy_data(**params)
         
-        results.append(f"\n=== Dados de {route} ===")
+        results.append(f"--- Resultados para Rota: {route} ---")
         results.append(data_result.content[0].text)
         
-        if data_result.is_error:
-            # Se falhou, tentar versão simplificada
-            simple_params = {
-                'route': route,
-                'data_elements': common_elements[:1],
-                'limit': 20
-            }
-            simple_result = await get_energy_data(**simple_params)
-            results.append(f"\n--- Tentativa simplificada ---")
-            results.append(simple_result.content[0].text)
-    
+        if include_metadata:
+            route_info = await get_route_info(route)
+            results.append(f"--- Metadados para Rota: {route} ---")
+            results.append(route_info.content[0].text)
+            
     if not results:
         return CallToolResult(
-            content=[TextContent(type="text", text=f"Não foi possível encontrar dados relevantes para: {query}")]
+            content=[TextContent(type="text", text="Nenhum dado ou rota relevante encontrado para sua consulta.")]
         )
     
     return CallToolResult(
-        content=[TextContent(type="text", text="\n".join(results))]
+        content=[TextContent(type="text", text="\n\n".join(results))]
     )
 
-# --- Recursos e Prompts ---
-# PARTE 1: Completar o conteúdo do guia (que está cortado no final)
-@mcp.resource(uri="eia://guide", name="Guia do Servidor EIA Otimizado", description="Guia completo e otimizado")
+@mcp.tool()
+async def get_series_data(series_id: str, start: Optional[str] = None, end: Optional[str] = None) -> CallToolResult:
+    """
+    Obtém dados usando Series ID da API v1 (compatibilidade reversa).
+    
+    Args:
+        series_id: ID da série (ex: "ELEC.SALES.US-ALL.A")
+        start: Data de início (ex: "2020")
+        end: Data de fim (ex: "2023")
+    """
+    route_path = f"seriesid/{series_id}"
+    params = {}
+    
+    if start:
+        params["start"] = start
+    if end:
+        params["end"] = end
+    
+    response = await make_eia_api_request(route_path, params)
+    
+    if not response or response.get("error"):
+        return CallToolResult(
+            is_error=True,
+            content=[TextContent(type="text", text=f"Erro ao obter dados da série '{series_id}': {response.get('message', 'Erro desconhecido')}")]
+        )
+    
+    response_content = response.get('response', {})
+    data = response_content.get('data', [])
+    
+    if not data:
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Nenhum dado encontrado para a série '{series_id}'.")]
+        )
+    
+    output_lines = [
+        f"Dados da Série: {series_id}",
+        f"Total de registros: {len(data)}",
+        ""
+    ]
+    
+    # Formatação dos dados da série
+    columns = list(data[0].keys()) if data else []
+    if columns:
+        header_line = "| " + " | ".join(columns) + " |"
+        separator_line = "|" + "---|".join(["---"] * len(columns)) + "|"
+        output_lines.extend([header_line, separator_line])
+        
+        for row in data:
+            row_values = [str(row.get(col, 'N/A')) for col in columns]
+            output_lines.append("| " + " | ".join(row_values) + " |")
+    
+    return CallToolResult(
+        content=[TextContent(type="text", text="\n".join(output_lines))]
+    )
+
+# --- Ferramenta para Teste Direto ---
+@mcp.tool()
+async def test_direct_api_call(url_path: str, params_dict: Optional[Dict[str, Any]] = None) -> CallToolResult:
+    """
+    Ferramenta para teste direto de chamadas da API EIA.
+    Use para debug e testes específicos.
+    
+    Args:
+        url_path: Caminho da URL (ex: "petroleum/crd/crpdn/data/")
+        params_dict: Parâmetros como dicionário
+    """
+    if params_dict is None:
+        params_dict = {}
+    
+    logger.info(f"Teste direto - URL: {url_path}")
+    logger.info(f"Teste direto - Parâmetros: {params_dict}")
+    
+    response = await make_eia_api_request(url_path, params_dict)
+    
+    if not response:
+        return CallToolResult(
+            is_error=True,
+            content=[TextContent(type="text", text="Falha na requisição - sem resposta")]
+        )
+    
+    # Retornar resposta bruta para análise
+    response_str = json.dumps(response, indent=2, ensure_ascii=False)
+    
+    return CallToolResult(
+        content=[TextContent(type="text", text=f"Resposta da API:\n\n{response_str}")]
+    )
+
+# --- Recursos ---
+@mcp.resource(uri="eia://guide", name="Guia do Servidor EIA", description="Guia completo para usar o servidor MCP da EIA")
 async def get_eia_guide() -> Resource:
     content = """
-# Guia do Servidor MCP da EIA - Versão Otimizada
+# Guia do Servidor MCP da EIA
 
-## Ferramentas Principais
+## Visão Geral
+Este servidor fornece acesso simplificado aos dados energéticos da EIA (Energy Information Administration) dos EUA.
 
-### 🎯 smart_energy_search() - RECOMENDADA
-A ferramenta mais inteligente para buscar dados de energia:
-```python
-# Busca automatizada com drill-down
-smart_energy_search(query="vendas de eletricidade no Texas em 2024")
+## Ferramentas Disponíveis
 
-# Apenas exploração
-smart_energy_search(query="dados de petróleo", auto_drill_down=False)
-```
+### 1. explore_energy_routes()
+Lista as categorias principais de dados e as rotas associadas. Útil para entender o escopo da API.
+**Exemplos de uso:**
+- `explore_energy_routes()`
+- `explore_energy_routes(category="electricity")`
 
-### 🔍 explore_energy_routes()
-Para descobrir rotas disponíveis:
-```python
-explore_energy_routes(category="electricity")
-explore_energy_routes(query="solar energy")
-```
+### 2. get_route_info()
+Obtém metadados detalhados de uma rota específica, incluindo elementos de dados, filtros (facets) e frequências disponíveis. Essencial para planejar sua consulta de dados.
+**Exemplos de uso:**
+- `get_route_info(route="electricity/retail-sales")`
 
-### 📊 get_energy_data() - Para controle preciso
-Quando você sabe exatamente o que quer:
-```python
-get_energy_data(
-    route="electricity/retail-sales",
-    data_elements=["sales"],
-    frequency="annual",
-    filters={"stateid": ["TX"], "sectorid": ["RES"]},
-    start_period="2020",
-    end_period="2024"
-)
-```
+### 3. get_energy_data()
+A ferramenta principal para recuperar dados energéticos. Requer uma rota específica e os elementos de dados desejados. Permite filtrar por frequência, período e outros facets.
+**Exemplos de uso:**
+- `get_energy_data(route="electricity/retail-sales", data_elements=["sales"], frequency="annual", start_period="2020", end_period="2022", filters={"stateid": ["TX"], "sectorid": ["RES"]})`
 
-### 🏷️ get_facet_values()
-Para descobrir valores de filtros:
-```python
-get_facet_values(route="electricity/retail-sales", facet_id="stateid")
-```
+### 4. get_facet_values()
+Para obter todos os valores possíveis para um filtro (facet) específico em uma rota. Ajuda a construir filtros precisos.
+**Exemplos de uso:**
+- `get_facet_values(route="electricity/retail-sales", facet_id="stateid")`
+- `get_facet_values(route="petroleum/supply/weekly", facet_id="duoarea")`
 
-### ℹ️ get_route_info()
-Para metadados detalhados:
-```python
-get_route_info(route="electricity/retail-sales")
-```
+### 5. smart_energy_search()
+A ferramenta mais inteligente e versátil. Ela tenta entender sua consulta em linguagem natural para:
+- Descobrir rotas relevantes automaticamente.
+- Extrair elementos de dados, filtros e períodos da sua query.
+- Tentar obter os dados diretamente, se possível.
+Use esta ferramenta como ponto de partida para a maioria das perguntas.
 
-## Melhorias da Versão Otimizada
+**Exemplos de uso:**
+- `smart_energy_search(query="vendas de eletricidade residencial no Texas em 2023")`
+- `smart_energy_search(query="geração eólica na Califórnia nos últimos 5 anos")`
+- `smart_energy_search(query="preço da gasolina nos EUA em 2024")`
 
-1. **Cache de Metadados**: Evita requisições desnecessárias
-2. **Busca Inteligente**: Combina descoberta e obtenção de dados
-3. **Detecção Automática**: Reconhece estados, setores e períodos na query
-4. **Drill-down Automático**: Navega sub-rotas automaticamente
-5. **Formatação Melhorada**: URLs de debug e orientações claras
-6. **Tratamento Robusto**: Múltiplas tentativas e fallbacks
+### 6. get_series_data()
+Para compatibilidade com Series IDs da API v1. Use se você tiver um ID de série específico da versão anterior da API EIA.
+**Exemplos de uso:**
+- `get_series_data(series_id="ELEC.SALES.US-ALL.A")`
 
-## Categorias Principais
+### 7. test_direct_api_call()
+Ferramenta para debug e testes diretos de chamadas da API EIA. Retorna a resposta bruta da API.
+**Exemplos de uso:**
+- `test_direct_api_call(url_path="electricity/retail-sales/data/", params_dict={"data": ["sales"], "frequency": "annual", "start": "2020"})`
 
-- **electricity**: Dados de eletricidade (geração, vendas, preços)
-- **petroleum**: Petróleo e derivados (produção, consumo, preços)
-- **natural-gas**: Gás natural (produção, consumo, preços)
-- **coal**: Carvão (produção, consumo)
-- **renewable**: Energias renováveis
-- **total-energy**: Balanço energético total
+## Correções Implementadas (Versão Atual)
 
-## Exemplos de Uso Prático
+- **Formatação de Parâmetros Aprimorada**: Arrays e objetos aninhados são formatados corretamente para a API EIA (ex: `data[0]=value`, `facets[stateid][]=TX`).
+- **Timeout Aumentado**: Para requisições mais longas, evitando timeouts prematuros.
+- **Logging Detalhado**: Melhora a capacidade de depuração e monitoramento.
+- **Tratamento Robusto de Erros**: Mensagens de erro da API são passadas de forma mais clara, e erros inesperados são tratados.
+- **Ordenação Padrão**: Dados são ordenados por padrão (coluna 'period', decrescente) para consistência.
+- **Retorno de Avisos da API EIA**: Mensagens de 'warning' da API são explicitamente incluídas na resposta.
+- **Orientação para Agregação Nacional**: Sugere ao usuário como obter totais nacionais ou interpretar dados desagregados.
+- **URL de Debug Explícita**: Inclui a URL completa da requisição da API (sem a chave secreta) para depuração.
+- **Melhoria do `smart_energy_search`**: Mais inteligente na extração de parâmetros e na condução da busca.
 
-### Consumo Residencial de Eletricidade
-```python
-smart_energy_search("consumo residencial de eletricidade em 2023")
-```
+## Fluxo Recomendado para Interação
 
-### Produção de Petróleo por Estado
-```python
-get_energy_data(
-    route="petroleum/crd/crpdn",
-    data_elements=["value"],
-    filters={"duoarea": ["R10", "R20"]},
-    frequency="monthly"
-)
-```
+1. **Início Exploratório**: Comece com `smart_energy_search(query="sua pergunta")` para a maioria das consultas, pois ele tenta automatizar a descoberta e recuperação.
+2. **Refinamento e Detalhes**: Se `smart_energy_search` não for suficiente ou precisar de mais clareza, use `get_route_info()` para entender as opções de uma rota, e `get_facet_values()` para ver valores de filtros.
+3. **Obtenção de Dados Direta**: Uma vez que você tenha a rota e os parâmetros exatos, use `get_energy_data()` para uma consulta mais controlada.
+4. **Debug**: Em caso de problemas, utilize `test_direct_api_call()` com a `url_path` e `params_dict` relevantes para inspecionar a resposta bruta da API.
 
-### Preços de Gasolina
-```python
-smart_energy_search("preços da gasolina nos últimos 2 anos")
-```
+## Categorias Principais de Dados
 
-## Dicas Importantes
+- **Eletricidade**: Geração, consumo, preços, capacidade (rotas como `electricity/retail-sales`, `electricity/electric-power-operational-data`)
+- **Petróleo**: Produção, refino, preços, estoques (rotas como `petroleum/crd/crpdn`, `petroleum/supply/weekly`)
+- **Gás Natural**: Produção, consumo, preços, capacidade (rotas como `natural-gas/prod`, `natural-gas/cons`)
+- **Carvão**: Produção, consumo, preços (rotas como `coal/production`, `coal/consumption`)
+- **Energia Renovável**: Solar, eólica, hidráulica (geralmente sob rotas de eletricidade)
+- **Energia Total**: Balanços energéticos, estatísticas consolidadas (rota `total-energy`)
 
-1. **Use smart_energy_search primeiro** - É a ferramenta mais eficiente
-2. **Especifique períodos** - A API tem muito dados históricos
-3. **Use filtros por estado** - Para dados específicos de regiões
-4. **Comece com annual** - Depois refine para monthly se necessário
-5. **Verifique facets** - Nem todas as rotas têm os mesmos filtros
+## Dicas
+
+- Use termos em português ou inglês nas consultas para `smart_energy_search`.
+- Seja específico sobre localização (estado, região) e período de tempo (ano, mês, intervalo) quando relevante.
+- Utilize os filtros (facets) para refinar seus resultados (por estado, setor, tipo de combustível, etc.).
+- A API EIA é vasta; se uma consulta inicial não for específica o suficiente, o assistente o guiará para refinar.
 """
     
     return Resource(
         uri="eia://guide",
-        name="Guia do Servidor EIA Otimizado",
-        mimeType="text/markdown",
+        name="Guia do Servidor EIA",
+        mime_type="text/markdown",
         text=content
     )
 
-# PARTE 2: Adicionar prompt template para consultas
-@mcp.prompt(
-    name="eia-query-helper",
-    description="Template para ajudar na construção de consultas à API EIA"
-)
-async def eia_query_helper(
-    topic: str = "electricity",
-    region: Optional[str] = None,
-    time_period: Optional[str] = None,
-    sector: Optional[str] = None
-) -> GetPromptResult:
-    """
-    Gera template para consultas otimizadas à API EIA.
-    
-    Args:
-        topic: Tópico energético (electricity, petroleum, natural-gas, coal, renewable)
-        region: Região/Estado (opcional)
-        time_period: Período de interesse (opcional)
-        sector: Setor específico (opcional)
-    """
-    
-    prompt_content = f"""
-# Consulta EIA - {topic.upper()}
-
-## Contexto
-Você está consultando dados de energia da U.S. Energy Information Administration (EIA).
-
-## Parâmetros da Consulta
-- **Tópico**: {topic}
-"""
-    
-    if region:
-        prompt_content += f"- **Região**: {region}\n"
-    if time_period:
-        prompt_content += f"- **Período**: {time_period}\n"
-    if sector:
-        prompt_content += f"- **Setor**: {sector}\n"
-    
-    prompt_content += f"""
-## Sugestões de Ferramentas
-
-### Para exploração inicial:
-```python
-smart_energy_search(query="{topic}"""
-    
-    if region:
-        prompt_content += f" {region}"
-    if time_period:
-        prompt_content += f" {time_period}"
-    if sector:
-        prompt_content += f" {sector}"
-    
-    prompt_content += f"""")
-```
-
-### Para dados específicos:
-```python
-explore_energy_routes(category="{topic}")
-```
-
-## Filtros Comuns para {topic.upper()}
-
-"""
-    
-    # Adicionar filtros específicos por categoria
-    if topic == "electricity":
-        prompt_content += """
-- **stateid**: Código do estado (ex: "TX", "CA", "US")
-- **sectorid**: Setor (RES=Residencial, COM=Comercial, IND=Industrial, TRA=Transporte)
-- **fueltypeid**: Tipo de combustível para geração
-"""
-    elif topic == "petroleum":
-        prompt_content += """
-- **area**: Área geográfica
-- **product**: Produto petrolífero (gasolina, diesel, etc.)
-- **duoarea**: Área PADD (Petroleum Administration for Defense Districts)
-"""
-    elif topic == "natural-gas":
-        prompt_content += """
-- **stateid**: Código do estado
-- **product**: Tipo de gás natural
-- **area**: Área geográfica
-"""
-    
-    prompt_content += """
-## Frequências Disponíveis
-- **annual**: Dados anuais (recomendado para início)
-- **monthly**: Dados mensais
-- **weekly**: Dados semanais (quando disponível)
-- **daily**: Dados diários (limitado)
-
-## Elementos de Dados Comuns
-- **value**: Valor principal do indicador
-- **sales**: Vendas (quando aplicável)
-- **price**: Preços
-- **generation**: Geração (para eletricidade)
-- **consumption**: Consumo
-"""
-    
+# --- Prompts ---
+@mcp.prompt()
+async def energy_data_assistant() -> GetPromptResult:
+    """Assistente especializado em dados energéticos da EIA."""
     return GetPromptResult(
-        description="Template otimizado para consultas EIA",
+        description="Assistente para análise de dados energéticos dos EUA usando a API da EIA",
         messages=[
             {
-                "role": "system",
-                "content": {
-                    "type": "text",
-                    "text": prompt_content
-                }
+                "role": "system", 
+                "content": TextContent(
+                    type="text", 
+                    text="""Você é um assistente especializado em dados energéticos dos EUA, com acesso à API da EIA através do servidor MCP.
+
+Sempre comece com a ferramenta `smart_energy_search(query="...")` para qualquer consulta. Esta ferramenta é a mais inteligente e tentará resolver a consulta do usuário de forma autônoma, descobrindo rotas, extraindo parâmetros e obtendo dados.
+
+Se `smart_energy_search` não for suficiente ou precisar de mais clareza:
+- Use `get_route_info(route="...")` para entender os elementos de dados, filtros e frequências de uma rota específica.
+- Use `get_facet_values(route="...", facet_id="...")` para listar valores possíveis para um filtro.
+- Em seguida, use `get_energy_data(route="...", data_elements=["..."], filters={...}, ...)` para obter os dados com os parâmetros corretos.
+
+Se a API retornar um aviso (AVISO DA API EIA), informe o usuário sobre ele.
+
+Quando dados desagregados (por exemplo, por estado ou setor) forem retornados, e a pergunta puder implicar um total nacional, lembre o usuário de que os dados podem precisar ser agregados manualmente, ou sugira que ele tente especificar `'stateid': ['US']` (ou o equivalente para outros filtros) para obter o agregado nacional, se a API o suportar para aquela rota.
+
+Para qualquer problema ou depuração profunda, utilize a ferramenta `test_direct_api_call(url_path="...", params_dict={...})`."""
+                )
             }
         ]
     )
 
-# PARTE 3: Função de inicialização e limpeza
-def setup_error_handlers():
-    """Configura handlers de erro globais."""
-    
-    async def handle_startup():
-        """Executado na inicialização do servidor."""
-        logger.info("🚀 Servidor EIA MCP iniciado")
-        logger.info(f"📡 Porta: {PORT}")
-        logger.info(f"🔑 API Key configurada: {'Sim' if EIA_API_KEY else 'Não'}")
-        
-        # Teste básico da API
-        if EIA_API_KEY:
-            test_response = await make_eia_api_request("")
-            if test_response and not test_response.get("error"):
-                logger.info("✅ Conexão com API EIA verificada")
-            else:
-                logger.warning("⚠️ Problema na conexão com API EIA")
-    
-    async def handle_shutdown():
-        """Executado no desligamento do servidor."""
-        logger.info("🛑 Servidor EIA MCP desligando...")
-        # Limpar cache se necessário
-        metadata_cache.clear()
-        logger.info("🏁 Servidor desligado com sucesso")
-    
-    # Registrar handlers se o FastMCP suportar
-    if hasattr(mcp, 'on_startup'):
-        mcp.on_startup(handle_startup)
-    if hasattr(mcp, 'on_shutdown'):
-        mcp.on_shutdown(handle_shutdown)
-
-# PARTE 4: Função principal para execução
-async def main():
-    """Função principal para executar o servidor."""
-    setup_error_handlers()
-    
-    try:
-        logger.info(f"🌟 Iniciando servidor EIA MCP na porta {PORT}")
-        await mcp.run()
-    except KeyboardInterrupt:
-        logger.info("👋 Servidor interrompido pelo usuário")
-    except Exception as e:
-        logger.error(f"💥 Erro fatal no servidor: {e}")
-        sys.exit(1)
-
-# PARTE 5: Ponto de entrada
-if __name__ == "__main__":
-    import asyncio
-    
-    # Verificar dependências críticas
-    if not EIA_API_KEY:
-        print("❌ ERRO: EIA_API_KEY não configurada!")
-        print("Configure a variável de ambiente EIA_API_KEY com sua chave da API EIA")
-        print("Obtenha uma chave gratuita em: https://www.eia.gov/opendata/register.php")
-        sys.exit(1)
-    
-    # Executar servidor
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n👋 Tchau!")
-    except Exception as e:
-        print(f"💥 Erro fatal: {e}")
-        sys.exit(1)
-
-# PARTE 6: Utilitários adicionais (opcional)
-class EIADataProcessor:
-    """Classe auxiliar para processamento de dados da EIA."""
-    
-    @staticmethod
-    def aggregate_by_state(data: List[Dict], value_column: str = "value") -> Dict[str, float]:
-        """Agrega dados por estado."""
-        aggregated = {}
-        for row in data:
-            state = row.get('stateid', 'Unknown')
-            value = row.get(value_column, 0)
-            if isinstance(value, (int, float)):
-                aggregated[state] = aggregated.get(state, 0) + value
-        return aggregated
-    
-    @staticmethod
-    def aggregate_by_period(data: List[Dict], value_column: str = "value") -> Dict[str, float]:
-        """Agrega dados por período."""
-        aggregated = {}
-        for row in data:
-            period = row.get('period', 'Unknown')
-            value = row.get(value_column, 0)
-            if isinstance(value, (int, float)):
-                aggregated[period] = aggregated.get(period, 0) + value
-        return aggregated
-    
-    @staticmethod
-    def format_large_numbers(value: Union[int, float]) -> str:
-        """Formata números grandes de forma legível."""
-        if not isinstance(value, (int, float)):
-            return str(value)
-        
-        if abs(value) >= 1_000_000_000:
-            return f"{value/1_000_000_000:.2f}B"
-        elif abs(value) >= 1_000_000:
-            return f"{value/1_000_000:.2f}M"
-        elif abs(value) >= 1_000:
-            return f"{value/1_000:.2f}K"
-        else:
-            return f"{value:.2f}"
-
-# PARTE 7: Configurações adicionais de logging
-def setup_detailed_logging():
-    """Configura logging mais detalhado para debug."""
-    
-    # Formatter personalizado
-    formatter = logging.Formatter(
-        fmt='%(asctime)s | %(levelname)8s | %(name)s | %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    
-    # Handler para arquivo (opcional)
-    if os.getenv("EIA_LOG_FILE"):
-        file_handler = logging.FileHandler(os.getenv("EIA_LOG_FILE"))
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    
-    # Handler para console com cores (se disponível)
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    
-    # Configurar nível baseado em variável de ambiente
-    log_level = os.getenv("EIA_LOG_LEVEL", "INFO").upper()
-    logger.setLevel(getattr(logging, log_level, logging.INFO))
-
-# Executar configuração de logging
-setup_detailed_logging()
