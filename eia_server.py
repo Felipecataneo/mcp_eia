@@ -365,71 +365,99 @@ Não encontrei rotas específicas para sua consulta. Aqui estão as categorias p
 {chr(10).join(subroutes_info)}
 
 🎯 **Para obter dados**, escolha uma sub-rota específica e chame novamente:
-```
 specific_route: "rota-escolhida"
-```
                 """)]
             )
         
-        # Fase 3: Se não temos parâmetros suficientes, mostrar metadados
-        if not data_elements:
-            metadata_info = [f"📋 **Metadados para**: `{specific_route}`\n"]
-            
-            if response_content.get('name'):
-                metadata_info.append(f"**Nome**: {response_content['name']}")
-            if response_content.get('description'):
-                metadata_info.append(f"**Descrição**: {response_content['description']}")
-            
-            # Elementos de dados disponíveis
-            data_meta = response_content.get('data', {})
-            if data_meta:
-                metadata_info.append("\n📊 **Elementos de dados disponíveis**:")
-                for col_id, col_info in list(data_meta.items())[:10]:  # Limitar
-                    if isinstance(col_info, dict):
-                        name = col_info.get('name', col_info.get('alias', col_id))
-                        units = col_info.get('units', 'N/A')
-                        metadata_info.append(f"  • `{col_id}`: {name} ({units})")
-                
-                if len(data_meta) > 10:
-                    metadata_info.append(f"  *... e mais {len(data_meta) - 10} elementos*")
-            
-            # Filtros/facets disponíveis
-            facets_meta = response_content.get('facets', [])
-            if facets_meta:
-                metadata_info.append("\n🔍 **Filtros disponíveis**:")
-                for facet in facets_meta[:8]:  # Limitar
-                    facet_id = facet.get('id', 'N/A')
-                    facet_name = facet.get('name', 'N/A')
-                    metadata_info.append(f"  • `{facet_id}`: {facet_name}")
-                
-                if len(facets_meta) > 8:
-                    metadata_info.append(f"  *... e mais {len(facets_meta) - 8} filtros*")
-            
-            # Frequências disponíveis
-            frequencies = response_content.get('frequency', [])
-            if frequencies:
-                freq_list = []
-                for freq in frequencies:
-                    freq_id = freq.get('id', freq.get('query', 'N/A'))
-                    freq_desc = freq.get('description', freq.get('name', ''))
-                    freq_list.append(f"`{freq_id}`" + (f" ({freq_desc})" if freq_desc else ""))
-                metadata_info.append(f"\n📅 **Frequências**: {', '.join(freq_list)}")
-            
-            metadata_info.append(f"""
-🎯 **Para obter dados reais**, chame novamente especificando:
-```
-data_elements: ["value"]  # ou outros elementos disponíveis
-facets: {{"filtro": ["valor"]}}  # opcional
-frequency: "monthly"  # opcional
-start_period: "2020"  # opcional
-end_period: "2023"  # opcional
-```
-            """)
-            
-            return CallToolResult(
-                content=[TextContent(type="text", text="\n".join(metadata_info))]
-            )
+        # --- INÍCIO DA LÓGICA DE TRATAMENTO DE ELEMENTOS DE DADOS ---
+
+        # Obter os elementos de dados disponíveis para esta rota a partir dos metadados
+        available_data_elements_meta = response_content.get('data', {})
         
+        # Variável para armazenar os elementos de dados que realmente serão buscados
+        elements_to_fetch = data_elements # Começa com o que o usuário forneceu (pode ser None)
+        
+        # Flag para indicar se 'value' foi assumido por padrão
+        assumed_value_default = False
+
+        # Cenário: Usuário NÃO especificou 'data_elements'
+        if not elements_to_fetch:
+            if available_data_elements_meta: # Se os metadados listam elementos de dados explicitamente
+                # Sub-cenário A: Há elementos explícitos, mas o usuário não escolheu.
+                # Exibe os metadados e pede para o usuário especificar.
+                metadata_info = [f"📋 **Metadados para**: `{specific_route}`\n"]
+                
+                if response_content.get('name'):
+                    metadata_info.append(f"**Nome**: {response_content['name']}")
+                if response_content.get('description'):
+                    metadata_info.append(f"**Descrição**: {response_content['description']}")
+                
+                # Elementos de dados disponíveis (populados a partir de available_data_elements_meta)
+                if available_data_elements_meta:
+                    metadata_info.append("\n📊 **Elementos de dados disponíveis**:")
+                    for col_id, col_info in list(available_data_elements_meta.items())[:10]:  # Limitar
+                        if isinstance(col_info, dict):
+                            name = col_info.get('name', col_info.get('alias', col_id))
+                            units = col_info.get('units', 'N/A')
+                            metadata_info.append(f"  • `{col_id}`: {name} ({units})")
+                    
+                    if len(available_data_elements_meta) > 10:
+                        metadata_info.append(f"  *... e mais {len(available_data_elements_meta) - 10} elementos*")
+                
+                # Filtros/facets disponíveis
+                facets_meta = response_content.get('facets', [])
+                if facets_meta:
+                    metadata_info.append("\n🔍 **Filtros disponíveis**:")
+                    for facet in facets_meta[:8]:  # Limitar
+                        facet_id = facet.get('id', 'N/A')
+                        facet_name = facet.get('name', 'N/A')
+                        metadata_info.append(f"  • `{facet_id}`: {facet_name}")
+                    
+                    if len(facets_meta) > 8:
+                        metadata_info.append(f"  *... e mais {len(facets_meta) - 8} filtros*")
+                
+                # Frequências disponíveis
+                frequencies = response_content.get('frequency', [])
+                if frequencies:
+                    freq_list = []
+                    for freq in frequencies:
+                        freq_id = freq.get('id', freq.get('query', 'N/A'))
+                        freq_desc = freq.get('description', freq.get('name', ''))
+                        freq_list.append(f"`{freq_id}`" + (f" ({freq_desc})" if freq_desc else ""))
+                    metadata_info.append(f"\n📅 **Frequências**: {', '.join(freq_list)}")
+                
+                metadata_info.append(f"""
+🎯 **Para obter dados reais**, chame novamente especificando:
+data_elements: ["value"] # ou outros elementos disponíveis
+facets: {{"filtro": ["valor"]}} # opcional
+frequency: "monthly" # opcional
+start_period: "2020" # opcional
+end_period: "2023" # opcional
+                """)
+                
+                return CallToolResult(
+                    content=[TextContent(type="text", text="\n".join(metadata_info))]
+                )
+            
+            else: # Sub-cenário B: Metadados 'data' está vazio (como em petroleum/crd/crpdn) E usuário não especificou.
+                  # Assume 'value' e prossegue.
+                elements_to_fetch = ["value"]
+                assumed_value_default = True # Seta a flag para adicionar nota no final
+        
+        # Cenário: Usuário ESPECIFICOU 'data_elements' (ou elements_to_fetch foi setado para ['value'] por padrão)
+        # Se elements_to_fetch foi fornecido pelo usuário E os metadados NÃO estavam vazios, então validamos
+        elif data_elements and available_data_elements_meta:
+            for de in data_elements:
+                if de not in available_data_elements_meta:
+                    return CallToolResult(
+                        is_error=True,
+                        content=[TextContent(type="text", text=f"❌ O elemento de dados '{de}' não está disponível para a rota '{specific_route}'. Elementos disponíveis: {', '.join(available_data_elements_meta.keys())}.")]
+                    )
+        # Se elements_to_fetch foi fornecido pelo usuário E os metadados estavam vazios,
+        # simplesmente prosseguimos sem validação estrita, pois a API da EIA pode ter campos implícitos.
+
+        # --- FIM DA LÓGICA DE TRATAMENTO DE ELEMENTOS DE DADOS ---
+
         # Fase 4: Recuperar dados reais
         data_route = f"{specific_route.rstrip('/')}/data"
         params = {
@@ -438,8 +466,8 @@ end_period: "2023"  # opcional
         }
         
         # Adicionar parâmetros
-        if data_elements:
-            params["data"] = data_elements
+        if elements_to_fetch: # Usa os elementos determinados, seja pelo usuário ou por padrão
+            params["data"] = elements_to_fetch
         if frequency:
             params["frequency"] = frequency
         if start_period:
@@ -474,7 +502,9 @@ end_period: "2023"  # opcional
             elif 'frequency' in error_msg:
                 error_details.append("\n💡 **Dica**: Verifique as frequências disponíveis nos metadados")
             elif 'data' in error_msg:
-                error_details.append("\n💡 **Dica**: Verifique os elementos de dados disponíveis nos metadados")
+                error_details.append("\n💡 **Dica**: Verifique os elementos de dados disponíveis nos metadados (se houver, chame `search_energy_data` sem `data_elements`)")
+            elif 'cannot specify' in error_msg and 'with' in error_msg:
+                 error_details.append("\n💡 **Dica**: Este erro incomum pode indicar que o elemento de dados solicitado não é compatível, ou que o formato da sua requisição tem um problema sutil não aparente. Verifique a documentação oficial da EIA para esta rota.")
             
             return CallToolResult(
                 is_error=True, 
@@ -490,7 +520,7 @@ end_period: "2023"  # opcional
 
 **Parâmetros utilizados**:
 - Rota: `{data_route}`
-- Elementos: `{data_elements}`
+- Elementos: `{elements_to_fetch}`
 - Filtros: `{facets}`
 - Frequência: `{frequency}`
 - Período: `{start_period}` até `{end_period}`
@@ -514,6 +544,10 @@ end_period: "2023"  # opcional
             f"📈 **Total de registros**: {total_records:,} (mostrando {len(actual_data):,})",
         ]
         
+        # Adicionar nota se 'value' foi assumido por padrão
+        if assumed_value_default:
+            output_lines.insert(2, f"💡 **Nota**: `data_elements` não foi especificado, e os metadados não listam elementos de dados explícitos. Assumindo `data_elements=['value']` por padrão.")
+
         # Adicionar informações sobre parâmetros usados
         if facets:
             facet_info = []
