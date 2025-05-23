@@ -341,10 +341,21 @@ Para obter dados, especifique uma sub-rota mais específica no parâmetro 'speci
     
     response_data = data_response.get('response', {})
     actual_data = response_data.get('data', [])
-    
-    if not actual_data:
+    # Adicionado: Captura a mensagem de warning da API
+    warning_message = response_data.get('warning') 
+
+    # Se não há dados retornados (e não é um erro fatal da API), informa ao LLM
+    if not actual_data and not response_data.get("error"):
+        output_message = f"Nenhum dado encontrado para os critérios especificados em '{data_route}'."
+        if warning_message:
+            output_message += f"\n\nAVISO DA API EIA: {warning_message}"
+        # Adiciona a URL completa de debug para o LLM, para que ele possa inspecionar se quiser
+        debug_params = {k: v for k, v in params.items() if k != 'api_key'}
+        full_url_with_params = f"{full_url.split('?')[0]}?{urlencode(debug_params)}"
+        output_message += f"\n\nURL da API (sem API Key): {full_url_with_params}"
+
         return CallToolResult(
-            content=[TextContent(type="text", text=f"Nenhum dado encontrado para os critérios especificados em '{data_route}'.")]
+            content=[TextContent(type="text", text=output_message)]
         )
     
     # Formatação melhorada dos dados
@@ -356,7 +367,36 @@ Para obter dados, especifique uma sub-rota mais específica no parâmetro 'speci
         ""
     ]
     
+    # Adicionado: Inclui o warning da API mesmo se houver dados
+    if warning_message: 
+        output_lines.append(f"AVISO DA API EIA: {warning_message}")
+        output_lines.append("") # Linha em branco para melhor formatação
+
     if actual_data:
+        # Adicionado: Heurística para orientar o LLM sobre dados desagregados
+        first_row_keys = actual_data[0].keys()
+        is_disaggregated_by_state_sector = 'stateid' in first_row_keys and 'sectorid' in first_row_keys
+
+        # Verifica se 'US' ou 'ALL' para stateid foi explicitamente solicitado
+        stateid_filter_values = filters.get('stateid', []) if filters else []
+        requested_national_aggregate = False
+        if isinstance(stateid_filter_values, list):
+            if 'US' in stateid_filter_values or 'ALL' in stateid_filter_values:
+                requested_national_aggregate = True
+        elif isinstance(stateid_filter_values, str):
+            if stateid_filter_values == 'US' or stateid_filter_values == 'ALL':
+                requested_national_aggregate = True
+
+        # Se os dados parecem desagregados e um total nacional não foi explicitamente pedido
+        if is_disaggregated_by_state_sector and not requested_national_aggregate:
+            output_lines.append(
+                "Os dados retornados são desagregados por estado e setor. "
+                "Para obter um total nacional, você pode precisar somar os valores relevantes "
+                "(ex: 'sales' para 'sectorid: ALL') de cada estado, "
+                "ou refinar a busca especificando 'filters={{'stateid': ['US']}}' para obter o agregado nacional (se disponível)."
+            )
+            output_lines.append("") # Linha em branco para melhor formatação
+
         # Cabeçalho da tabela
         columns = list(actual_data[0].keys())
         header_line = "| " + " | ".join(columns) + " |"
@@ -380,6 +420,11 @@ Para obter dados, especifique uma sub-rota mais específica no parâmetro 'speci
         if response_data.get('total', 0) > len(actual_data):
             output_lines.append(f"- Dados paginados: apenas {len(actual_data)} de {response_data['total']} registros mostrados")
     
+    # Adicionado: Adiciona a URL da API (sem API Key) para que o LLM possa debuggar ou re-testar se necessário
+    debug_params = {k: v for k, v in params.items() if k != 'api_key'}
+    full_url_with_params = f"{full_url.split('?')[0]}?{urlencode(debug_params)}"
+    output_lines.append(f"URL da API (sem API Key): {full_url_with_params}")
+
     return CallToolResult(
         content=[TextContent(type="text", text="\n".join(output_lines))]
     )
@@ -561,6 +606,9 @@ Para testes e debug diretos:
 3. **Logging Melhorado**: Para debug detalhado
 4. **Tratamento de Erros**: Mais robusto e informativo
 5. **Ordenação Padrão**: Incluída automaticamente
+6. **Retorno de Avisos da API EIA**: O MCP agora repassa mensagens de 'warning' da API.
+7. **Orientação para Agregação Nacional**: Se os dados são desagregados e um total nacional é implicado, o MCP orienta o LLM.
+8. **URL de Debug**: A URL completa da API (sem a chave) é incluída para depuração.
 
 ## Fluxo Recomendado
 
@@ -613,6 +661,10 @@ Use a ferramenta search_energy_data() como ponto de partida para qualquer consul
 3. Recuperar dados reais quando os parâmetros estão completos
 
 Sempre comece com consultas gerais e vá refinando conforme necessário. Seja proativo em sugerir filtros e parâmetros úteis baseados no contexto da pergunta do usuário.
+
+Se a API retornar um aviso (AVISO DA API EIA), informe o usuário sobre ele.
+
+Quando dados desagregados (por estado/setor) forem retornados, e a pergunta implicar um total nacional, lembre o usuário de que os dados precisam ser agregados ou que ele pode tentar especificar 'stateid': 'US' para um total direto, se a API o suportar para essa rota.
 
 Se algo não funcionar, use a ferramenta test_direct_api_call() para debug."""
                 )
